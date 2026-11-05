@@ -1,0 +1,7 @@
+build/
+*.obj
+*.exp
+*.ilk
+*.pdb
+*.dll.old
+AerodromeList.ini
