@@ -17,8 +17,10 @@ The plug-in looks for `<FIR>\ASR\GRP` folders by walking up from its own
 folder, from the folders of the other loaded plug-ins (TopSky, GRplugin and so
 on) and from EuroScope's working folder. Near each of those it also looks one or
 two levels into neighbouring folders, so the four `*-Install_*` folders side by
-side are all found, wherever the DLL itself lives. If the window title says
-"no ASR folder found", add the folder in `AerodromeList.ini`:
+side are all found, wherever the DLL itself lives. Only the closest copy of
+each FIR is used, so older copies of the sector files elsewhere are ignored. If
+the window title says "no ASR folder found", add the folder in
+`AerodromeList.ini`:
 
 ```ini
 [Folders]
@@ -27,23 +29,40 @@ AsrFolders=D:\Some\Path\VABF\ASR\GRP;D:\Another\SectorRoot
 
 ## Use
 
+The window is styled like EuroScope's own lists. It lists the aerodromes of the
+loaded sector file that have an ASR in the GRP folders.
+
 | Action | Result |
 |---|---|
 | Click an aerodrome | Opens its ASR, or switches to it if it's already open |
-| Right-click | Choose between several ASRs for the same aerodrome (shown as a `+n` badge) |
-| Type in the box | Filter by ICAO code or name; **Enter** opens the first match, **↓** moves into the list |
-| What's listed | Only aerodromes from the sector file that have an ASR in the GRP folders |
-| Green bar | The ASR you last opened from the list |
+| Click the pin in front of an aerodrome | Pins it to the top of the list (click again to unpin) |
+| Drag a pinned aerodrome up or down | Changes the order of the pinned aerodromes |
+| Type in the search box | Filters by ICAO code or name; **↓** moves into the list |
+| Type a full ICAO and press **Enter** | Opens that aerodrome's ASR straight away |
+| **Master** button | Goes back to the FIR's Master ASR (`<FIR>\ASR\*Master*.asr`) |
+| ▲ on the title strip (or double-click the title) | Collapses the window to its title strip |
+| Right-click an aerodrome | Pin or unpin, or choose between several ASRs (shown as a `+n` badge) |
+| Green ICAO | The ASR you last opened from the list |
+
+Drag the title strip to move the window, and drag its edges to resize it.
 
 Commands for the EuroScope command line:
 
 * `.adl`: hide or show the window for this session (it always reappears when EuroScope starts)
+* `.adl VABB`: open that aerodrome's ASR
+* `.adl master`: go back to the Master ASR
 * `.adl top`: make the window stay on top of all apps (by default it stays on top of EuroScope only)
 * `.adl reload`: scan the ASR folders again (after you add or rename ASR files)
-* `.adl info`: show which ASR folders were found and whether the ASR loader was found
+* `.adl info`: write `AerodromeList-info.txt` next to the DLL, listing the ASR folders found, the Master ASR and the open ASRs
 
-The window's position and size are saved in `AerodromeList.ini` next to the
-DLL. It has no close button, so it can't be closed by accident.
+Everything you change in the list is saved as you go, in `AerodromeList.ini`
+next to the DLL. That covers the pinned aerodromes and their order, the window's
+position and size, whether it is collapsed, and how far the list is scrolled.
+Changes are written a fraction of a second after you make them, not only when
+EuroScope closes. So when you close EuroScope (or it crashes) and open the
+sector files again, the list comes back exactly as you left it. Each FIR's copy
+of the DLL keeps its own settings. The window has no close button, so it can't
+be closed by accident.
 
 ## How it stays fast
 

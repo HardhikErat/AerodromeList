@@ -5,3 +5,4 @@ build/
 *.pdb
 *.dll.old
 AerodromeList.ini
+AerodromeList-info.txt

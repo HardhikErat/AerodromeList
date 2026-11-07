@@ -1,321 +1,80 @@
 // Aerodrome List - EuroScope plug-in
 //
-// Shows a small always-available window listing every aerodrome in the loaded
-// sector file. Clicking an aerodrome opens its ground ASR (from
-// <FIR>\ASR\GRP\*.asr), or switches to it if it is already open.
+// A small always-available window, styled like EuroScope's own lists, showing
+// every aerodrome of the loaded sector file that has a ground ASR in
+// <FIR>\ASR\GRP. Clicking one opens its ASR (or switches to it if already open).
+// Aerodromes can be pinned to the top and reordered by dragging; a Master
+// button returns to the FIR's Master ASR.
 
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
-#include <dwmapi.h>
-#include <tlhelp32.h>
-#include <uxtheme.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "../sdk/EuroScopePlugIn.h"
+#include "AsrIndex.h"
 #include "AsrOpener.h"
+
+using namespace adl;
 
 namespace {
 
 const char* const kPluginName = "Aerodrome List";
-const char* const kPluginVersion = "1.0.0";
+const char* const kPluginVersion = "1.1.0";
 const char* const kPluginAuthor = "Hardhik Erat";
 const char* const kPluginLicense = "Free to use";
-
-const wchar_t* const kFirFolders[] = {L"VABF", L"VOMF", L"VIDF", L"VECF"};
 
 const UINT WM_APP_INDEX_READY = WM_APP + 1;
 const UINT WM_APP_OPEN_ITEM = WM_APP + 2;
 const UINT WM_APP_RETURN_FOCUS = WM_APP + 3;
 
 const int IDC_FILTER = 1001;
-const int IDC_LIST = 1002;
+const int IDM_PIN = 1900;
 const int IDM_ASR_BASE = 2000;
 
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
+const wchar_t* const kFrameClass = L"AerodromeListPluginWindow";
+const wchar_t* const kRowsClass = L"AerodromeListPluginRows";
 
-std::string Narrow(const std::wstring& w)
-{
-    if (w.empty()) return {};
-    int n = WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, '\0');
-    WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
-    return s;
-}
+// --- Look: matches EuroScope's built-in lists ----------------------------------
 
-std::wstring Widen(const std::string& s)
-{
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_ACP, 0, s.c_str(), (int)s.size(), &w[0], n);
-    return w;
-}
+const COLORREF kBody = RGB(30, 30, 30);
+const COLORREF kStrip = RGB(38, 38, 38);
+const COLORREF kBevelLight = RGB(88, 88, 88);
+const COLORREF kBevelMid = RGB(69, 69, 69);
+const COLORREF kBevelDark = RGB(17, 17, 17);
+const COLORREF kField = RGB(22, 22, 22);
+const COLORREF kButton = RGB(58, 58, 58);
+const COLORREF kButtonDown = RGB(44, 44, 44);
+const COLORREF kText = RGB(187, 187, 187);
+const COLORREF kTextBright = RGB(215, 215, 215);
+const COLORREF kTextDim = RGB(120, 122, 123);
+const COLORREF kHover = RGB(43, 43, 43);
+const COLORREF kSelected = RGB(55, 55, 55);
+const COLORREF kPinOn = RGB(220, 200, 40); // EuroScope yellow
+const COLORREF kPinOff = RGB(78, 78, 78);
+const COLORREF kActive = RGB(80, 200, 110);
 
-std::string Upper(std::string s)
-{
-    for (char& c : s) c = (char)toupper((unsigned char)c);
-    return s;
-}
+const int kHeaderH = 15;
+const int kToolbarH = 22;
+const int kRowH = 18;
+const int kPinW = 20;
+const int kScrollW = 8;
+const int kGrip = 5;
+const int kMasterW = 58;
 
-std::wstring UpperW(std::wstring s)
-{
-    CharUpperBuffW(&s[0], (DWORD)s.size());
-    return s;
-}
-
-bool DirectoryExists(const std::wstring& path)
-{
-    DWORD a = GetFileAttributesW(path.c_str());
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-std::wstring ParentDir(const std::wstring& path)
-{
-    size_t p = path.find_last_of(L"\\/");
-    if (p == std::wstring::npos || p < 3) return {};
-    return path.substr(0, p);
-}
-
-std::wstring ModulePath()
-{
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&ModulePath), &self);
-    wchar_t buf[MAX_PATH * 2];
-    DWORD n = GetModuleFileNameW(self, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
-    return std::wstring(buf, n);
-}
-
-std::wstring FullPath(const std::wstring& p)
-{
-    wchar_t buf[MAX_PATH * 2];
-    DWORD n = GetFullPathNameW(p.c_str(), (DWORD)(sizeof(buf) / sizeof(buf[0])), buf, nullptr);
-    return n ? std::wstring(buf, n) : p;
-}
-
-// "MUMBAI/CHHATRAPATI SHIVAJI" -> "Mumbai/Chhatrapati Shivaji"
-std::string TitleCase(const std::string& s)
-{
-    std::string r = s;
-    bool start = true;
-    for (char& c : r) {
-        unsigned char u = (unsigned char)c;
-        if (isalpha(u)) {
-            c = (char)(start ? toupper(u) : tolower(u));
-            start = false;
-        } else {
-            start = (c != '\'');
-        }
-    }
-    return r;
-}
-
-// ICAO code at the start of an ASR file name: "VABB-GND.asr", "VOAT GND.asr", "VIDP-SMR.asr".
-std::string IcaoFromFileName(const std::wstring& file)
-{
-    std::string icao;
-    for (wchar_t c : file) {
-        if (icao.size() == 4) break;
-        if (iswalnum(c)) {
-            icao.push_back((char)towupper(c));
-        } else {
-            break;
-        }
-    }
-    return icao.size() == 4 ? icao : std::string();
-}
-
-// ---------------------------------------------------------------------------
-// ASR index (built on a worker thread)
-// ---------------------------------------------------------------------------
-
-struct AsrIndex {
-    std::map<std::string, std::vector<std::wstring>> asrByIcao; // full paths, preferred first
-    std::map<std::string, std::string> airportNames;
-    std::vector<std::wstring> grpFolders;
-};
-
-void AddGrpFolder(const std::wstring& dir, std::vector<std::wstring>& out, std::set<std::wstring>& seen)
-{
-    if (!DirectoryExists(dir)) return;
-    std::wstring key = UpperW(FullPath(dir));
-    if (seen.insert(key).second) out.push_back(FullPath(dir));
-}
-
-void FindGrpFolders(const std::wstring& root, std::vector<std::wstring>& out, std::set<std::wstring>& seen)
-{
-    for (const wchar_t* fir : kFirFolders) {
-        AddGrpFolder(root + L"\\" + fir + L"\\ASR\\GRP", out, seen);
-    }
-}
-
-void LoadAirportNames(const std::wstring& file, std::map<std::string, std::string>& names)
-{
-    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                           FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    LARGE_INTEGER size{};
-    GetFileSizeEx(h, &size);
-    std::string buf((size_t)size.QuadPart, '\0');
-    DWORD read = 0;
-    ReadFile(h, &buf[0], (DWORD)buf.size(), &read, nullptr);
-    CloseHandle(h);
-    buf.resize(read);
-
-    size_t pos = 0;
-    while (pos < buf.size()) {
-        size_t eol = buf.find('\n', pos);
-        if (eol == std::string::npos) eol = buf.size();
-        std::string line = buf.substr(pos, eol - pos);
-        pos = eol + 1;
-        if (line.empty() || line[0] == ';') continue;
-        size_t t1 = line.find('\t');
-        if (t1 == std::string::npos) continue;
-        size_t t2 = line.find('\t', t1 + 1);
-        std::string icao = Upper(line.substr(0, t1));
-        std::string name = line.substr(t1 + 1, t2 == std::string::npos ? std::string::npos : t2 - t1 - 1);
-        while (!name.empty() && (name.back() == '\r' || name.back() == ' ')) name.pop_back();
-        if (icao.size() == 4 && !name.empty() && !names.count(icao)) names[icao] = TitleCase(name);
-    }
-}
-
-void PrewarmFile(const std::wstring& path)
-{
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                           FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    char buf[64 * 1024];
-    DWORD read = 0;
-    while (ReadFile(h, buf, sizeof(buf), &read, nullptr) && read) {
-    }
-    CloseHandle(h);
-}
-
-// Directories of every DLL loaded into EuroScope (other plug-ins such as TopSky or
-// GRplugin live inside <FIR>\Plugins, so they point straight at the sector tree).
-std::vector<std::wstring> LoadedModuleDirs()
-{
-    std::vector<std::wstring> dirs;
-    wchar_t winDir[MAX_PATH] = {};
-    GetWindowsDirectoryW(winDir, MAX_PATH);
-    std::wstring win = UpperW(winDir);
-
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
-    if (snap == INVALID_HANDLE_VALUE) return dirs;
-    MODULEENTRY32W me{sizeof(me)};
-    std::set<std::wstring> seen;
-    for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
-        std::wstring dir = ParentDir(me.szExePath);
-        std::wstring key = UpperW(dir);
-        if (dir.empty() || key.compare(0, win.size(), win) == 0) continue;
-        if (seen.insert(key).second) dirs.push_back(dir);
-    }
-    CloseHandle(snap);
-    return dirs;
-}
-
-std::vector<std::wstring> SubDirectories(const std::wstring& dir)
-{
-    std::vector<std::wstring> out;
-    WIN32_FIND_DATAW fd;
-    HANDLE f = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchLimitToDirectories, nullptr,
-                                FIND_FIRST_EX_LARGE_FETCH);
-    if (f == INVALID_HANDLE_VALUE) return out;
-    do {
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.' &&
-            !(fd.dwFileAttributes & (FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT))) {
-            out.push_back(dir + L"\\" + fd.cFileName);
-        }
-    } while (FindNextFileW(f, &fd));
-    FindClose(f);
-    return out;
-}
-
-AsrIndex BuildIndex(const std::wstring& pluginDir, const std::vector<std::wstring>& extraFolders)
-{
-    AsrIndex index;
-    std::set<std::wstring> seen;
-
-    // 1. Folders configured in the ini (either GRP folders or sector roots).
-    for (const std::wstring& f : extraFolders) {
-        AddGrpFolder(f, index.grpFolders, seen);
-        FindGrpFolders(f, index.grpFolders, seen);
-    }
-
-    // 2. Walk up from a set of starting folders - this plug-in's folder, every
-    //    other loaded plug-in's folder, and EuroScope's working folder - looking
-    //    for <root>\<FIR>\ASR\GRP. Near the start folder we also look one and two
-    //    levels into sibling folders, so separate VABF/VOMF/VIDF/VECF installs
-    //    that sit side by side ("Sector Files\VABF-Install_...\VABF") are found
-    //    whichever one the plug-in was loaded from.
-    std::vector<std::wstring> starts;
-    starts.push_back(pluginDir);
-    for (const std::wstring& d : LoadedModuleDirs()) starts.push_back(d);
-    wchar_t cwd[MAX_PATH * 2] = {};
-    if (GetCurrentDirectoryW(MAX_PATH * 2, cwd)) starts.push_back(cwd);
-
-    std::set<std::wstring> walked; // ancestor folders already searched
-    for (const std::wstring& start : starts) {
-        std::wstring dir = start;
-        for (int depth = 0; depth < 5 && !dir.empty(); ++depth, dir = ParentDir(dir)) {
-            if (!walked.insert(UpperW(dir)).second) continue;
-            FindGrpFolders(dir, index.grpFolders, seen);
-            if (depth == 0) continue;
-            bool isTopLevel = ParentDir(dir).empty(); // e.g. "D:\VATSIM" - don't go two deep there
-            for (const std::wstring& sub : SubDirectories(dir)) {
-                FindGrpFolders(sub, index.grpFolders, seen);
-                if (depth <= 3 && !isTopLevel) {
-                    for (const std::wstring& sub2 : SubDirectories(sub)) FindGrpFolders(sub2, index.grpFolders, seen);
-                }
-            }
-        }
-    }
-
-    // 3. Index *.asr files and pick up ICAO_Airports.txt next to them.
-    bool namesLoaded = false;
-    for (const std::wstring& grp : index.grpFolders) {
-        std::vector<std::wstring> files;
-        WIN32_FIND_DATAW fd;
-        HANDLE f = FindFirstFileExW((grp + L"\\*.asr").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
-                                    FIND_FIRST_EX_LARGE_FETCH);
-        if (f != INVALID_HANDLE_VALUE) {
-            do {
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(fd.cFileName);
-            } while (FindNextFileW(f, &fd));
-            FindClose(f);
-        }
-        std::sort(files.begin(), files.end(),
-                  [](const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
-        for (const std::wstring& file : files) {
-            std::string icao = IcaoFromFileName(file);
-            if (!icao.empty()) index.asrByIcao[icao].push_back(grp + L"\\" + file);
-        }
-
-        if (!namesLoaded) {
-            std::wstring firDir = ParentDir(ParentDir(grp)); // ...\<FIR>
-            std::wstring namesFile = firDir + L"\\ICAO\\ICAO_Airports.txt";
-            if (GetFileAttributesW(namesFile.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                LoadAirportNames(namesFile, index.airportNames);
-                namesLoaded = true;
-            }
-        }
-    }
-
-    return index;
-}
+const UINT_PTR kSaveTimer = 1;
+const UINT kSaveDelayMs = 400; // changes are written this long after they stop
 
 // ---------------------------------------------------------------------------
 // Settings (AerodromeList.ini next to the DLL)
@@ -324,39 +83,40 @@ AsrIndex BuildIndex(const std::wstring& pluginDir, const std::vector<std::wstrin
 struct Settings {
     std::wstring file;
     RECT rect{0, 0, 0, 0};
-    bool visible = true;
     bool topmost = false;
+    bool collapsed = false;
+    int scrollTop = 0; // list scroll position in pixels
     std::vector<std::wstring> extraFolders;
+    std::vector<std::string> pins;
 
     void Load()
     {
-        wchar_t buf[2048];
+        wchar_t buf[4096];
         rect.left = GetPrivateProfileIntW(L"Window", L"X", INT_MIN, file.c_str());
         rect.top = GetPrivateProfileIntW(L"Window", L"Y", INT_MIN, file.c_str());
         int w = GetPrivateProfileIntW(L"Window", L"Width", 0, file.c_str());
         int h = GetPrivateProfileIntW(L"Window", L"Height", 0, file.c_str());
         rect.right = rect.left + w;
         rect.bottom = rect.top + h;
-        visible = true; // the window always comes up at start-up; .adl hides it for the session only
         topmost = GetPrivateProfileIntW(L"Window", L"AlwaysOnTop", 0, file.c_str()) != 0;
-        GetPrivateProfileStringW(L"Folders", L"AsrFolders", L"", buf, 2048, file.c_str());
-        std::wstring all = buf;
-        size_t pos = 0;
-        while (pos <= all.size()) {
-            size_t sep = all.find(L';', pos);
-            if (sep == std::wstring::npos) sep = all.size();
-            std::wstring part = all.substr(pos, sep - pos);
-            while (!part.empty() && iswspace(part.back())) part.pop_back();
-            while (!part.empty() && iswspace(part.front())) part.erase(part.begin());
-            if (!part.empty()) {
-                if (part.size() > 1 && part[1] != L':' && part[0] != L'\\') part = ParentDir(file) + L"\\" + part;
-                extraFolders.push_back(part);
-            }
-            pos = sep + 1;
+        collapsed = GetPrivateProfileIntW(L"Window", L"Collapsed", 0, file.c_str()) != 0;
+        scrollTop = std::max(0, (int)GetPrivateProfileIntW(L"List", L"ScrollTop", 0, file.c_str()));
+
+        GetPrivateProfileStringW(L"Folders", L"AsrFolders", L"", buf, 4096, file.c_str());
+        for (const std::wstring& part : Split(buf)) {
+            std::wstring p = part;
+            if (p.size() > 1 && p[1] != L':' && p[0] != L'\\') p = ParentDir(file) + L"\\" + p;
+            extraFolders.push_back(p);
+        }
+
+        GetPrivateProfileStringW(L"Pins", L"Order", L"", buf, 4096, file.c_str());
+        for (const std::wstring& part : SplitAny(buf, L",; ")) {
+            std::string icao = Upper(Narrow(part));
+            if (!icao.empty() && std::find(pins.begin(), pins.end(), icao) == pins.end()) pins.push_back(icao);
         }
     }
 
-    void Save() const
+    void SaveWindow() const
     {
         auto put = [&](const wchar_t* key, int v) {
             WritePrivateProfileStringW(L"Window", key, std::to_wstring(v).c_str(), file.c_str());
@@ -365,31 +125,146 @@ struct Settings {
         put(L"Y", rect.top);
         put(L"Width", rect.right - rect.left);
         put(L"Height", rect.bottom - rect.top);
-        WritePrivateProfileStringW(L"Window", L"Visible", nullptr, file.c_str()); // no longer persisted
         put(L"AlwaysOnTop", topmost ? 1 : 0);
+        put(L"Collapsed", collapsed ? 1 : 0);
+        WritePrivateProfileStringW(L"Window", L"Visible", nullptr, file.c_str()); // no longer used
+        WritePrivateProfileStringW(L"List", L"ScrollTop", std::to_wstring(scrollTop).c_str(), file.c_str());
+    }
+
+    void SavePins() const
+    {
+        std::wstring all;
+        for (const std::string& p : pins) all += (all.empty() ? L"" : L",") + Widen(p);
+        WritePrivateProfileStringW(L"Pins", L"Order", all.c_str(), file.c_str());
     }
 
     bool HasRect() const
     {
         return rect.left != INT_MIN && rect.top != INT_MIN && rect.right - rect.left > 50 &&
-               rect.bottom - rect.top > 80;
+               rect.bottom - rect.top > 40;
     }
+
+    static std::vector<std::wstring> SplitAny(const std::wstring& all, const wchar_t* seps)
+    {
+        std::vector<std::wstring> out;
+        size_t pos = 0;
+        while (pos <= all.size()) {
+            size_t sep = all.find_first_of(seps, pos);
+            if (sep == std::wstring::npos) sep = all.size();
+            std::wstring part = all.substr(pos, sep - pos);
+            while (!part.empty() && iswspace(part.back())) part.pop_back();
+            while (!part.empty() && iswspace(part.front())) part.erase(part.begin());
+            if (!part.empty()) out.push_back(part);
+            pos = sep + 1;
+        }
+        return out;
+    }
+    static std::vector<std::wstring> Split(const std::wstring& all) { return SplitAny(all, L";"); }
 };
 
 // ---------------------------------------------------------------------------
-// Colours
+// Drawing helpers
 // ---------------------------------------------------------------------------
 
-const COLORREF kBack = RGB(0x1C, 0x20, 0x24);
-const COLORREF kBackAlt = RGB(0x22, 0x27, 0x2C);
-const COLORREF kEditBack = RGB(0x2A, 0x30, 0x36);
-const COLORREF kText = RGB(0xE2, 0xE6, 0xEA);
-const COLORREF kTextDim = RGB(0x8A, 0x93, 0x9C);
-const COLORREF kTextNoAsr = RGB(0x5C, 0x63, 0x6A);
-const COLORREF kHover = RGB(0x2C, 0x3A, 0x48);
-const COLORREF kSelected = RGB(0x1F, 0x5A, 0x8C);
-const COLORREF kAccent = RGB(0x3D, 0xA5, 0xFF);
-const COLORREF kActive = RGB(0x47, 0xC2, 0x7A);
+void Fill(HDC dc, const RECT& r, COLORREF c)
+{
+    SetBkColor(dc, c);
+    ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &r, nullptr, 0, nullptr);
+}
+
+void HLine(HDC dc, int x0, int x1, int y, COLORREF c)
+{
+    RECT r{x0, y, x1, y + 1};
+    Fill(dc, r, c);
+}
+
+void VLine(HDC dc, int x, int y0, int y1, COLORREF c)
+{
+    RECT r{x, y0, x + 1, y1};
+    Fill(dc, r, c);
+}
+
+// EuroScope style 3D edge: light top/left, dark bottom/right (reversed when sunken).
+void Bevel(HDC dc, const RECT& r, COLORREF face, bool raised)
+{
+    Fill(dc, r, face);
+    COLORREF tl = raised ? kBevelLight : kBevelDark;
+    COLORREF br = raised ? kBevelDark : kBevelLight;
+    HLine(dc, r.left, r.right, r.top, tl);
+    VLine(dc, r.left, r.top, r.bottom, tl);
+    HLine(dc, r.left, r.right, r.bottom - 1, br);
+    VLine(dc, r.right - 1, r.top, r.bottom, br);
+}
+
+void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT flags)
+{
+    SetTextColor(dc, c);
+    SetBkMode(dc, TRANSPARENT);
+    DrawTextW(dc, s.c_str(), (int)s.size(), &r, flags | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+// Small push-pin: round head with a needle.
+void DrawPin(HDC dc, int cx, int cy, bool pinned, bool hot)
+{
+    COLORREF c = pinned ? kPinOn : (hot ? kText : kPinOff);
+    HPEN pen = CreatePen(PS_SOLID, 1, c);
+    HBRUSH brush = pinned ? CreateSolidBrush(c) : (HBRUSH)GetStockObject(NULL_BRUSH);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, brush);
+    Ellipse(dc, cx - 3, cy - 6, cx + 4, cy + 1);
+    MoveToEx(dc, cx, cy + 1, nullptr);
+    LineTo(dc, cx, cy + 6);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(pen);
+    if (pinned) DeleteObject(brush);
+}
+
+void DrawTriangle(HDC dc, int cx, int cy, bool up, COLORREF c)
+{
+    POINT p[3];
+    if (up) {
+        p[0] = {cx - 3, cy + 2};
+        p[1] = {cx + 3, cy + 2};
+        p[2] = {cx, cy - 2};
+    } else {
+        p[0] = {cx - 3, cy - 2};
+        p[1] = {cx + 3, cy - 2};
+        p[2] = {cx, cy + 2};
+    }
+    HPEN pen = CreatePen(PS_SOLID, 1, c);
+    HBRUSH brush = CreateSolidBrush(c);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, brush);
+    Polygon(dc, p, 3);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
+
+bool FontInstalled(const wchar_t* face)
+{
+    LOGFONTW lf{};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(lf.lfFaceName, face);
+    bool found = false;
+    HDC dc = GetDC(nullptr);
+    EnumFontFamiliesExW(
+        dc, &lf, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM lp) -> int {
+            *reinterpret_cast<bool*>(lp) = true;
+            return 0;
+        },
+        reinterpret_cast<LPARAM>(&found), 0);
+    ReleaseDC(nullptr, dc);
+    return found;
+}
+
+HFONT MakeFont(const wchar_t* face, int height, int weight = FW_NORMAL)
+{
+    return CreateFontW(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, face);
+}
 
 // ---------------------------------------------------------------------------
 // Plug-in
@@ -412,54 +287,97 @@ public:
     void OnAirportRunwayActivityChanged() override;
 
 private:
-    // window plumbing
-    static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-    static LRESULT CALLBACK ListProc(HWND, UINT, WPARAM, LPARAM);
-    static LRESULT CALLBACK FilterProc(HWND, UINT, WPARAM, LPARAM);
-    LRESULT HandleMessage(UINT, WPARAM, LPARAM);
-    LRESULT HandleListMessage(UINT, WPARAM, LPARAM);
-    LRESULT HandleFilterMessage(UINT, WPARAM, LPARAM);
+    enum class Button { None, Collapse, Master };
 
+    // window procedures
+    static LRESULT CALLBACK FrameProc(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK RowsProc(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK FilterProc(HWND, UINT, WPARAM, LPARAM);
+    LRESULT HandleFrame(UINT, WPARAM, LPARAM);
+    LRESULT HandleRows(UINT, WPARAM, LPARAM);
+    LRESULT HandleFilter(UINT, WPARAM, LPARAM);
+
+    // frame
     void EnsureWindow();
-    void CreateFonts();
+    void CreateResources();
     void Layout();
-    void DrawItem(const DRAWITEMSTRUCT* dis);
-    void ShowAsrMenu(int item, POINT screenPt);
+    void PaintFrame(HDC dc);
+    Button ButtonAt(POINT pt) const;
+    void SetCollapsed(bool collapsed);
     void SetVisible(bool visible);
     void SaveRect();
+    void QueueSave();  // save window/list state shortly after a change
+    void SaveNow();    // save everything immediately
+    HWND FindEuroScopeWindow() const;
+
+    // rows
+    void PaintRows(HDC dc, const RECT& rc);
+    int RowCount() const { return (int)visible_.size(); }
+    int ContentHeight() const { return RowCount() * kRowH; }
+    bool HasScrollbar() const;
+    RECT ThumbRect() const;
+    int ItemAt(int y) const;
+    void ScrollTo(int top);
+    void TryRestoreScroll();
+    void EnsureVisible(int item);
+    void InvalidateRows() { if (rows_) InvalidateRect(rows_, nullptr, FALSE); }
+    void ShowContextMenu(int item, POINT screenPt);
 
     // data
     void StartIndexing();
     void ApplyIndex();
     bool RefreshSectorAirports(bool force);
     void RebuildList();
+    bool IsPinned(const std::string& icao) const;
+    void TogglePin(std::string icao);
+    void ApplyDrop(int from, int slot);
     void OpenItem(int item, int asrChoice);
+    void OpenIcao(std::string icao, int asrChoice);
+    void OpenMaster();
+    std::wstring ChooseMaster() const;
+    bool OpenPath(const std::wstring& path, const std::string& what);
+    void WriteInfo();
     void Message(const std::string& text, bool flash = false);
-
-    HWND FindEuroScopeWindow() const;
 
     HWND hwnd_ = nullptr;
     HWND filter_ = nullptr;
-    HWND list_ = nullptr;
+    HWND rows_ = nullptr;
     HWND owner_ = nullptr;
-    WNDPROC listDefault_ = nullptr;
     WNDPROC filterDefault_ = nullptr;
-    HFONT font_ = nullptr;
-    HFONT fontBold_ = nullptr;
-    HBRUSH backBrush_ = nullptr;
-    HBRUSH editBrush_ = nullptr;
-    int itemHeight_ = 20;
+    HFONT titleFont_ = nullptr;
+    HFONT listFont_ = nullptr;
+    HFONT buttonFont_ = nullptr;
+    HBRUSH fieldBrush_ = nullptr;
+    std::wstring listFace_;
+
+    // frame layout & state
+    RECT headerRc_{}, collapseRc_{}, masterRc_{}, fieldRc_{}, rowsRc_{};
+    Button pressed_ = Button::None;
+    Button hot_ = Button::None;
+    int expandedHeight_ = 0;
+
+    // rows state
+    int top_ = 0;           // scroll offset in pixels
     int hover_ = -1;
+    bool hoverPin_ = false;
+    int sel_ = -1;
+    int pressItem_ = -1;
+    bool pressOnPin_ = false;
+    POINT pressPt_{};
+    bool dragging_ = false;
+    int dropSlot_ = -1;
+    bool thumbDrag_ = false;
+    int thumbGrab_ = 0;
     bool trackingMouse_ = false;
-    int pressedItem_ = -1;
 
     Settings settings_;
     std::wstring pluginDir_;
 
     std::vector<std::string> sectorAirports_; // ICAO codes, sorted
     std::string sectorSignature_;
-    std::vector<Airport> airports_;           // full list
-    std::vector<int> visible_;                // indices into airports_ after filtering
+    std::vector<Airport> airports_; // sector aerodromes that have an ASR
+    std::vector<int> visible_;      // indices into airports_: pinned (in pin order) first, then A-Z
+    int pinnedVisible_ = 0;
     std::string lastOpenedIcao_;
 
     std::thread indexThread_;
@@ -470,19 +388,26 @@ private:
     AsrIndex index_;
     bool indexLoaded_ = false;
     int reindexAttempts_ = 0;
+    bool scrollRestored_ = false; // saved scroll position applied once the list has content
 
     bool openerReady_ = false;
     std::string openerDiagnostic_;
 };
 
 AerodromeListPlugin* g_plugin = nullptr;
-const wchar_t* const kWindowClass = L"AerodromeListPluginWindow";
+
+HINSTANCE ThisModule()
+{
+    HINSTANCE inst = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&ThisModule), &inst);
+    return inst;
+}
 
 AerodromeListPlugin::AerodromeListPlugin()
     : CPlugIn(EuroScopePlugIn::COMPATIBILITY_CODE, kPluginName, kPluginVersion, kPluginAuthor, kPluginLicense)
 {
-    std::wstring dll = ModulePath();
-    pluginDir_ = ParentDir(dll);
+    pluginDir_ = ParentDir(ModulePath());
     settings_.file = pluginDir_ + L"\\AerodromeList.ini";
     settings_.Load();
 
@@ -502,21 +427,17 @@ AerodromeListPlugin::~AerodromeListPlugin()
 {
     notifyHwnd_ = nullptr;
     if (indexThread_.joinable()) indexThread_.join();
-    if (hwnd_) {
-        SaveRect();
-        settings_.Save();
-        DestroyWindow(hwnd_);
-        hwnd_ = nullptr;
+    if (hwnd_ && IsWindow(hwnd_)) {
+        DestroyWindow(hwnd_); // WM_DESTROY writes the final state
+    } else {
+        SaveNow();            // window already gone (EuroScope closed it): write what we have
     }
-    // The class points at code in this DLL; unregister it so a reload re-registers cleanly.
-    HINSTANCE inst = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&AerodromeListPlugin::WndProc), &inst);
-    UnregisterClassW(kWindowClass, inst);
-    if (font_) DeleteObject(font_);
-    if (fontBold_) DeleteObject(fontBold_);
-    if (backBrush_) DeleteObject(backBrush_);
-    if (editBrush_) DeleteObject(editBrush_);
+    hwnd_ = nullptr;
+    // The classes point at code in this DLL; unregister them so a reload re-registers cleanly.
+    UnregisterClassW(kFrameClass, ThisModule());
+    UnregisterClassW(kRowsClass, ThisModule());
+    for (HGDIOBJ o : {(HGDIOBJ)titleFont_, (HGDIOBJ)listFont_, (HGDIOBJ)buttonFont_, (HGDIOBJ)fieldBrush_})
+        if (o) DeleteObject(o);
 }
 
 void AerodromeListPlugin::Message(const std::string& text, bool flash)
@@ -538,6 +459,7 @@ void AerodromeListPlugin::StartIndexing()
         std::vector<std::wstring> toWarm;
         for (auto& kv : result->asrByIcao)
             for (auto& p : kv.second) toWarm.push_back(p);
+        for (auto& kv : result->masterByGrp) toWarm.push_back(kv.second);
         {
             std::lock_guard<std::mutex> lock(indexMutex_);
             pendingIndex_ = std::move(result);
@@ -591,107 +513,213 @@ bool AerodromeListPlugin::RefreshSectorAirports(bool force)
     return true;
 }
 
+bool AerodromeListPlugin::IsPinned(const std::string& icao) const
+{
+    return std::find(settings_.pins.begin(), settings_.pins.end(), icao) != settings_.pins.end();
+}
+
 void AerodromeListPlugin::RebuildList()
 {
+    std::string selIcao = (sel_ >= 0 && sel_ < RowCount()) ? airports_[visible_[sel_]].icao : "";
+
     airports_.clear();
-    airports_.reserve(sectorAirports_.size());
     for (const std::string& icao : sectorAirports_) {
+        auto f = index_.asrByIcao.find(icao);
+        if (f == index_.asrByIcao.end() || f->second.empty()) continue; // only aerodromes that have an ASR
         Airport a;
         a.icao = icao;
         auto n = index_.airportNames.find(icao);
         if (n != index_.airportNames.end()) a.name = n->second;
-        auto f = index_.asrByIcao.find(icao);
-        if (f == index_.asrByIcao.end() || f->second.empty()) continue; // only aerodromes that have an ASR
         a.asrs = f->second;
         airports_.push_back(std::move(a));
     }
 
-    if (!list_) return;
-
-    // Filter
     wchar_t text[64] = {};
     if (filter_) GetWindowTextW(filter_, text, 64);
     std::string needle = Upper(Narrow(text));
     while (!needle.empty() && needle.back() == ' ') needle.pop_back();
-
-    std::wstring selectedIcao;
-    int sel = (int)SendMessageW(list_, LB_GETCURSEL, 0, 0);
-    if (sel >= 0) {
-        wchar_t buf[16] = {};
-        if (SendMessageW(list_, LB_GETTEXTLEN, sel, 0) < 15) SendMessageW(list_, LB_GETTEXT, sel, (LPARAM)buf);
-        selectedIcao = buf;
-    }
+    auto matches = [&](const Airport& a) {
+        return needle.empty() || a.icao.find(needle) != std::string::npos ||
+               Upper(a.name).find(needle) != std::string::npos;
+    };
 
     visible_.clear();
-    for (int i = 0; i < (int)airports_.size(); ++i) {
-        const Airport& a = airports_[i];
-        if (!needle.empty() && a.icao.find(needle) == std::string::npos &&
-            Upper(a.name).find(needle) == std::string::npos) {
-            continue;
+    for (const std::string& pin : settings_.pins) {
+        for (int i = 0; i < (int)airports_.size(); ++i) {
+            if (airports_[i].icao == pin && matches(airports_[i])) visible_.push_back(i);
         }
-        visible_.push_back(i);
+    }
+    pinnedVisible_ = (int)visible_.size();
+    for (int i = 0; i < (int)airports_.size(); ++i) {
+        if (!IsPinned(airports_[i].icao) && matches(airports_[i])) visible_.push_back(i);
     }
 
-    SendMessageW(list_, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(list_, LB_RESETCONTENT, 0, 0);
-    for (int idx : visible_) {
-        SendMessageW(list_, LB_ADDSTRING, 0, (LPARAM)Widen(airports_[idx].icao).c_str());
-    }
-    if (!selectedIcao.empty()) {
-        LRESULT found = SendMessageW(list_, LB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)selectedIcao.c_str());
-        if (found != LB_ERR) SendMessageW(list_, LB_SETCURSEL, found, 0);
-    }
+    sel_ = -1;
+    for (int i = 0; i < RowCount(); ++i)
+        if (airports_[visible_[i]].icao == selIcao) sel_ = i;
     hover_ = -1;
-    SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(list_, nullptr, TRUE);
-
-    wchar_t title[96];
-    if (indexLoaded_ && index_.grpFolders.empty())
-        swprintf_s(title, L"Aerodromes  (no ASR folder found)");
-    else
-        swprintf_s(title, L"Aerodromes  %d", (int)airports_.size());
-    SetWindowTextW(hwnd_, title);
+    ScrollTo(top_);
+    TryRestoreScroll();
+    InvalidateRows();
 }
 
-void AerodromeListPlugin::OpenItem(int item, int asrChoice)
+void AerodromeListPlugin::TogglePin(std::string icao)
 {
-    if (item < 0 || item >= (int)visible_.size()) return;
-    const Airport& a = airports_[visible_[item]];
-    if (a.asrs.empty()) {
-        Message("No ASR found for " + a.icao + " in the GRP folders.");
-        return;
+    auto& pins = settings_.pins;
+    auto it = std::find(pins.begin(), pins.end(), icao);
+    if (it != pins.end()) {
+        pins.erase(it);
+    } else {
+        pins.push_back(icao);
     }
-    int choice = (asrChoice >= 0 && asrChoice < (int)a.asrs.size()) ? asrChoice : 0;
-    std::string path = Narrow(a.asrs[choice]);
+    settings_.SavePins();
+    RebuildList();
+}
 
-    AsrOpener::Result r = AsrOpener::Open(path);
+void AerodromeListPlugin::ApplyDrop(int from, int slot)
+{
+    if (from < 0 || from >= pinnedVisible_ || slot < 0 || slot == from || slot == from + 1) return;
+
+    auto& pins = settings_.pins;
+    std::string moving = airports_[visible_[from]].icao;
+    bool after = slot >= pinnedVisible_;
+    std::string anchor = airports_[visible_[after ? pinnedVisible_ - 1 : slot]].icao;
+
+    pins.erase(std::find(pins.begin(), pins.end(), moving));
+    auto pos = std::find(pins.begin(), pins.end(), anchor);
+    if (after && pos != pins.end()) ++pos;
+    pins.insert(pos, moving);
+    settings_.SavePins();
+
+    RebuildList();
+    for (int i = 0; i < RowCount(); ++i)
+        if (airports_[visible_[i]].icao == moving) sel_ = i;
+    InvalidateRows();
+}
+
+bool AerodromeListPlugin::OpenPath(const std::wstring& path, const std::string& what)
+{
+    std::string p = Narrow(path);
+    AsrOpener::Result r = AsrOpener::Open(p);
     if (r == AsrOpener::Result::Opened) {
-        lastOpenedIcao_ = a.icao;
-        InvalidateRect(list_, nullptr, FALSE);
         PostMessageW(hwnd_, WM_APP_RETURN_FOCUS, 0, 0);
-        return;
+        return true;
     }
 
     // Fallback: put the path on the clipboard so it can be pasted in Open SCT > Open...
     if (OpenClipboard(hwnd_)) {
         EmptyClipboard();
-        std::wstring w = a.asrs[choice];
-        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (w.size() + 1) * sizeof(wchar_t));
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (path.size() + 1) * sizeof(wchar_t));
         if (mem) {
-            memcpy(GlobalLock(mem), w.c_str(), (w.size() + 1) * sizeof(wchar_t));
+            memcpy(GlobalLock(mem), path.c_str(), (path.size() + 1) * sizeof(wchar_t));
             GlobalUnlock(mem);
             SetClipboardData(CF_UNICODETEXT, mem);
         }
         CloseClipboard();
     }
     if (r == AsrOpener::Result::Refused) {
-        Message("EuroScope could not open " + path + " (path copied to clipboard).");
+        Message("EuroScope could not open the " + what + " ASR " + p + " (path copied to clipboard).");
     } else if (r == AsrOpener::Result::Crashed) {
         Message("Opening the ASR failed inside EuroScope; direct loading is now disabled for this session. "
-                "Path copied to clipboard: " + path);
+                "Path copied to clipboard: " + p);
     } else {
-        Message("Direct ASR loading is unavailable in this EuroScope version. Path copied to clipboard: " + path);
+        Message("Direct ASR loading is unavailable in this EuroScope version. Path copied to clipboard: " + p);
     }
+    return false;
+}
+
+void AerodromeListPlugin::OpenIcao(std::string icao, int asrChoice)
+{
+    auto f = index_.asrByIcao.find(icao);
+    if (f == index_.asrByIcao.end() || f->second.empty()) {
+        Message("No ASR found for " + icao + ".");
+        return;
+    }
+    const auto& asrs = f->second;
+    int choice = (asrChoice >= 0 && asrChoice < (int)asrs.size()) ? asrChoice : 0;
+    if (OpenPath(asrs[choice], icao)) {
+        lastOpenedIcao_ = icao;
+        InvalidateRows();
+    }
+}
+
+void AerodromeListPlugin::OpenItem(int item, int asrChoice)
+{
+    if (item < 0 || item >= RowCount()) return;
+    OpenIcao(airports_[visible_[item]].icao, asrChoice);
+}
+
+// The Master ASR of the FIR the loaded sector belongs to: the GRP folder that
+// holds most of this sector's aerodrome ASRs decides which FIR that is.
+std::wstring AerodromeListPlugin::ChooseMaster() const
+{
+    std::map<std::wstring, int> votes;
+    for (const Airport& a : airports_) votes[ParentDir(a.asrs.front())]++;
+    std::wstring best;
+    int bestVotes = -1;
+    for (const auto& kv : votes) {
+        auto m = index_.masterByGrp.find(kv.first);
+        if (m != index_.masterByGrp.end() && kv.second > bestVotes) {
+            best = m->second;
+            bestVotes = kv.second;
+        }
+    }
+    if (best.empty()) {
+        for (const std::wstring& grp : index_.grpFolders) {
+            auto m = index_.masterByGrp.find(grp);
+            if (m != index_.masterByGrp.end()) return m->second;
+        }
+    }
+    return best;
+}
+
+void AerodromeListPlugin::OpenMaster()
+{
+    std::wstring master = ChooseMaster();
+    if (master.empty()) {
+        // No Master ASR on disk next to the GRP folders: fall back to an open tab called "...Master...".
+        std::vector<std::string> open;
+        if (AsrOpener::OpenAsrPaths(open)) {
+            for (const std::string& p : open) {
+                if (Upper(p).find("MASTER") != std::string::npos) {
+                    master = Widen(p);
+                    break;
+                }
+            }
+        }
+    }
+    if (master.empty()) {
+        Message("No Master ASR found (looked for <FIR>\\ASR\\*Master*.asr).");
+        return;
+    }
+    if (OpenPath(master, "Master")) {
+        lastOpenedIcao_.clear();
+        InvalidateRows();
+    }
+}
+
+void AerodromeListPlugin::WriteInfo()
+{
+    std::wstring file = pluginDir_ + L"\\AerodromeList-info.txt";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, file.c_str(), L"w") != 0 || !f) return;
+    fprintf(f, "Aerodrome List %s\nASR loader: %s\n\nGRP folders:\n", kPluginVersion, openerDiagnostic_.c_str());
+    for (auto& g : index_.grpFolders) {
+        auto m = index_.masterByGrp.find(g);
+        fprintf(f, "  %s\n    master: %s\n", Narrow(g).c_str(),
+                m == index_.masterByGrp.end() ? "(none)" : Narrow(m->second).c_str());
+    }
+    fprintf(f, "\nMaster for this sector: %s\n", Narrow(ChooseMaster()).c_str());
+    fprintf(f, "\nASRs open in EuroScope:\n");
+    std::vector<std::string> open;
+    if (AsrOpener::OpenAsrPaths(open)) {
+        for (auto& p : open) fprintf(f, "  %s\n", p.c_str());
+    } else {
+        fprintf(f, "  (unavailable)\n");
+    }
+    fprintf(f, "\nListed aerodromes: %d, pinned: %d\n", (int)airports_.size(), (int)settings_.pins.size());
+    fclose(f);
+    Message("Diagnostics written to " + Narrow(file));
 }
 
 // --- EuroScope callbacks ------------------------------------------------------
@@ -737,19 +765,22 @@ bool AerodromeListPlugin::OnCompileCommand(const char* command)
         if (hwnd_)
             SetWindowPos(hwnd_, settings_.topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        settings_.Save();
+        settings_.SaveWindow();
         Message(settings_.topmost ? "Window is now always on top of all apps." : "Window stays above EuroScope only.");
+    } else if (arg == "MASTER") {
+        OpenMaster();
     } else if (arg == "INFO") {
-        std::string folders;
-        for (auto& f : index_.grpFolders) folders += (folders.empty() ? "" : " | ") + Narrow(f);
-        Message("ASR loader: " + openerDiagnostic_ + ". GRP folders: " + (folders.empty() ? "none" : folders));
-    } else {
+        WriteInfo();
+    } else if (arg.empty()) {
         SetVisible(!(hwnd_ && IsWindowVisible(hwnd_)));
+    } else {
+        // ".adl VABB" opens that aerodrome's ASR
+        OpenIcao(arg, -1);
     }
     return true;
 }
 
-// --- window -------------------------------------------------------------------
+// --- window: frame -------------------------------------------------------------
 
 HWND AerodromeListPlugin::FindEuroScopeWindow() const
 {
@@ -772,90 +803,75 @@ HWND AerodromeListPlugin::FindEuroScopeWindow() const
     return ctx.found;
 }
 
-void AerodromeListPlugin::CreateFonts()
+void AerodromeListPlugin::CreateResources()
 {
-    NONCLIENTMETRICSW ncm{sizeof(ncm)};
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-    LOGFONTW lf = ncm.lfMessageFont;
-    lf.lfHeight = -12;
-    lf.lfQuality = CLEARTYPE_QUALITY;
-    wcscpy_s(lf.lfFaceName, L"Segoe UI");
-    font_ = CreateFontIndirectW(&lf);
-    lf.lfWeight = FW_SEMIBOLD;
-    lf.lfHeight = -13;
-    wcscpy_s(lf.lfFaceName, L"Consolas");
-    fontBold_ = CreateFontIndirectW(&lf);
+    listFace_ = FontInstalled(L"EuroScope") ? L"EuroScope" : L"Consolas";
+    titleFont_ = CreateFontW(-11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Tahoma");
+    listFont_ = MakeFont(listFace_.c_str(), 14);
+    buttonFont_ = MakeFont(listFace_.c_str(), 13);
+    fieldBrush_ = CreateSolidBrush(kField);
 }
 
 void AerodromeListPlugin::EnsureWindow()
 {
     if (hwnd_) return;
-
-    HINSTANCE inst = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&AerodromeListPlugin::WndProc), &inst);
+    HINSTANCE inst = ThisModule();
 
     WNDCLASSEXW wc{sizeof(wc)};
-    if (!GetClassInfoExW(inst, kWindowClass, &wc)) {
+    if (!GetClassInfoExW(inst, kFrameClass, &wc)) {
         wc = WNDCLASSEXW{sizeof(wc)};
-        wc.lpfnWndProc = &AerodromeListPlugin::WndProc;
+        wc.lpfnWndProc = &AerodromeListPlugin::FrameProc;
         wc.hInstance = inst;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.lpszClassName = kWindowClass;
-        wc.style = CS_DBLCLKS;
+        wc.lpszClassName = kFrameClass;
+        RegisterClassExW(&wc);
+    }
+    if (!GetClassInfoExW(inst, kRowsClass, &wc)) {
+        wc = WNDCLASSEXW{sizeof(wc)};
+        wc.lpfnWndProc = &AerodromeListPlugin::RowsProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kRowsClass;
         RegisterClassExW(&wc);
     }
 
-    backBrush_ = CreateSolidBrush(kBack);
-    editBrush_ = CreateSolidBrush(kEditBack);
-    CreateFonts();
-
+    CreateResources();
     owner_ = FindEuroScopeWindow();
 
     RECT r = settings_.rect;
     // Ignore a saved position that is no longer on any monitor (e.g. a display was removed).
     bool onScreen = settings_.HasRect() && MonitorFromRect(&r, MONITOR_DEFAULTTONULL) != nullptr;
     if (!onScreen) {
-        RECT work;
         HMONITOR mon = MonitorFromWindow(owner_ ? owner_ : GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(mon, &mi);
-        work = mi.rcWork;
-        int w = 230, h = 380;
-        r = {work.right - w - 24, work.top + 140, work.right - 24, work.top + 140 + h};
+        int w = 250, h = 380;
+        r = {mi.rcWork.right - w - 24, mi.rcWork.top + 140, mi.rcWork.right - 24, mi.rcWork.top + 140 + h};
     }
+    expandedHeight_ = r.bottom - r.top;
 
-    hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW | (settings_.topmost ? WS_EX_TOPMOST : 0), kWindowClass, L"Aerodromes",
-                            WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_CLIPCHILDREN, r.left, r.top,
-                            r.right - r.left, r.bottom - r.top, owner_, nullptr, inst, this);
+    hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW | (settings_.topmost ? WS_EX_TOPMOST : 0), kFrameClass, L"Aerodromes",
+                            WS_POPUP | WS_CLIPCHILDREN, r.left, r.top, r.right - r.left, r.bottom - r.top, owner_,
+                            nullptr, inst, this);
     if (!hwnd_) return;
-
-    BOOL dark = TRUE;
-    DwmSetWindowAttribute(hwnd_, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
 
     filter_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_UPPERCASE, 0, 0, 10, 10,
                               hwnd_, (HMENU)(INT_PTR)IDC_FILTER, inst, nullptr);
-    SendMessageW(filter_, WM_SETFONT, (WPARAM)font_, TRUE);
-    SendMessageW(filter_, EM_SETCUEBANNER, TRUE, (LPARAM)L"Filter (ICAO or name)");
-    SendMessageW(filter_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(6, 6));
+    SendMessageW(filter_, WM_SETFONT, (WPARAM)listFont_, TRUE);
+    SendMessageW(filter_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
+    SendMessageW(filter_, EM_SETLIMITTEXT, 40, 0);
     SetWindowLongPtrW(filter_, GWLP_USERDATA, (LONG_PTR)this);
     filterDefault_ = (WNDPROC)SetWindowLongPtrW(filter_, GWLP_WNDPROC, (LONG_PTR)&AerodromeListPlugin::FilterProc);
 
-    list_ = CreateWindowExW(0, L"LISTBOX", L"",
-                            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS |
-                                LBS_NOINTEGRALHEIGHT | LBS_WANTKEYBOARDINPUT,
-                            0, 0, 10, 10, hwnd_, (HMENU)(INT_PTR)IDC_LIST, inst, nullptr);
-    SendMessageW(list_, WM_SETFONT, (WPARAM)font_, TRUE);
-    SendMessageW(list_, LB_SETITEMHEIGHT, 0, itemHeight_);
-    SetWindowTheme(list_, L"DarkMode_Explorer", nullptr);
-    SetWindowLongPtrW(list_, GWLP_USERDATA, (LONG_PTR)this);
-    listDefault_ = (WNDPROC)SetWindowLongPtrW(list_, GWLP_WNDPROC, (LONG_PTR)&AerodromeListPlugin::ListProc);
+    rows_ = CreateWindowExW(0, kRowsClass, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10, hwnd_, nullptr,
+                            inst, this);
 
     notifyHwnd_ = hwnd_;
+    if (settings_.collapsed) SetCollapsed(true);
     Layout();
     RebuildList();
     if (indexReady_) ApplyIndex();
-
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
 }
 
@@ -864,110 +880,138 @@ void AerodromeListPlugin::Layout()
     if (!hwnd_) return;
     RECT rc;
     GetClientRect(hwnd_, &rc);
-    const int pad = 6, editH = 24;
-    MoveWindow(filter_, pad, pad, rc.right - 2 * pad, editH, TRUE);
-    MoveWindow(list_, 0, pad * 2 + editH, rc.right, rc.bottom - (pad * 2 + editH), TRUE);
+    const int W = rc.right, H = rc.bottom;
+
+    headerRc_ = {1, 1, W - 1, 1 + kHeaderH};
+    collapseRc_ = {W - 1 - 14, 3, W - 3, 1 + kHeaderH - 2};
+
+    int y0 = headerRc_.bottom + 4;
+    masterRc_ = {W - 5 - kMasterW, y0, W - 5, y0 + kToolbarH};
+    fieldRc_ = {5, y0, masterRc_.left - 5, y0 + kToolbarH};
+    rowsRc_ = {1, fieldRc_.bottom + 5, W - 1, H - 1};
+
+    bool show = !settings_.collapsed;
+    ShowWindow(filter_, show ? SW_SHOW : SW_HIDE);
+    ShowWindow(rows_, show ? SW_SHOW : SW_HIDE);
+    if (!show) return;
+
+    TEXTMETRICW tm{};
+    HDC dc = GetDC(filter_);
+    HGDIOBJ old = SelectObject(dc, listFont_);
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, old);
+    ReleaseDC(filter_, dc);
+    int editH = tm.tmHeight;
+    int editY = fieldRc_.top + (kToolbarH - editH) / 2;
+    MoveWindow(filter_, fieldRc_.left + 5, editY, fieldRc_.right - fieldRc_.left - 9, editH, TRUE);
+    MoveWindow(rows_, rowsRc_.left, rowsRc_.top, rowsRc_.right - rowsRc_.left,
+               std::max(0, (int)(rowsRc_.bottom - rowsRc_.top)), TRUE);
+    ScrollTo(top_);
+    TryRestoreScroll();
+}
+
+void AerodromeListPlugin::PaintFrame(HDC dc)
+{
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    Fill(dc, rc, kBody);
+
+    // outer edge
+    HLine(dc, 0, rc.right, 0, kBevelMid);
+    VLine(dc, 0, 0, rc.bottom, kBevelMid);
+    HLine(dc, 0, rc.right, rc.bottom - 1, kBevelDark);
+    VLine(dc, rc.right - 1, 0, rc.bottom, kBevelDark);
+
+    // title strip
+    Bevel(dc, headerRc_, kStrip, true);
+    SelectObject(dc, titleFont_);
+    RECT title = headerRc_;
+    title.right = collapseRc_.left - 2;
+    title.left += 4;
+    std::wstring caption = L"Aerodromes";
+    if (indexLoaded_ && index_.grpFolders.empty()) caption += L" - no ASR folder found";
+    Text(dc, caption, title, kTextBright, DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+
+    // collapse button
+    bool down = pressed_ == Button::Collapse && hot_ == Button::Collapse;
+    Bevel(dc, collapseRc_, kButton, !down);
+    DrawTriangle(dc, (collapseRc_.left + collapseRc_.right) / 2, (collapseRc_.top + collapseRc_.bottom) / 2,
+                 !settings_.collapsed, kTextBright);
+
+    if (settings_.collapsed) return;
+
+    // search field (sunken) and Master button (raised)
+    Bevel(dc, fieldRc_, kField, false);
+    down = pressed_ == Button::Master && hot_ == Button::Master;
+    Bevel(dc, masterRc_, down ? kButtonDown : kButton, !down);
+    SelectObject(dc, buttonFont_);
+    RECT mr = masterRc_;
+    if (down) OffsetRect(&mr, 1, 1);
+    Text(dc, L"Master", mr, kTextBright, DT_CENTER | DT_VCENTER);
+
+    // line above the list
+    HLine(dc, 1, rc.right - 1, rowsRc_.top - 2, kBevelDark);
+    HLine(dc, 1, rc.right - 1, rowsRc_.top - 1, kBevelMid);
+}
+
+AerodromeListPlugin::Button AerodromeListPlugin::ButtonAt(POINT pt) const
+{
+    if (PtInRect(&collapseRc_, pt)) return Button::Collapse;
+    if (!settings_.collapsed && PtInRect(&masterRc_, pt)) return Button::Master;
+    return Button::None;
+}
+
+void AerodromeListPlugin::SetCollapsed(bool collapsed)
+{
+    RECT wr;
+    GetWindowRect(hwnd_, &wr);
+    if (collapsed && !settings_.collapsed) expandedHeight_ = wr.bottom - wr.top;
+    settings_.collapsed = collapsed;
+    int h = collapsed ? kHeaderH + 2 : std::max(expandedHeight_, 120);
+    SetWindowPos(hwnd_, nullptr, 0, 0, wr.right - wr.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    Layout();
+    InvalidateRect(hwnd_, nullptr, TRUE);
+    SaveNow();
 }
 
 void AerodromeListPlugin::SetVisible(bool visible)
 {
     if (!hwnd_) EnsureWindow();
     if (!hwnd_) return;
-    settings_.visible = visible;
-    SaveRect();
+    SaveNow();
     ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
-    settings_.Save();
 }
 
 void AerodromeListPlugin::SaveRect()
 {
     if (!hwnd_) return;
     WINDOWPLACEMENT wp{sizeof(wp)};
-    if (GetWindowPlacement(hwnd_, &wp)) settings_.rect = wp.rcNormalPosition;
+    if (!GetWindowPlacement(hwnd_, &wp)) return;
+    settings_.rect = wp.rcNormalPosition;
+    // remember the expanded size, also while collapsed
+    if (settings_.collapsed) settings_.rect.bottom = settings_.rect.top + expandedHeight_;
+    else expandedHeight_ = settings_.rect.bottom - settings_.rect.top;
 }
 
-void AerodromeListPlugin::DrawItem(const DRAWITEMSTRUCT* dis)
+void AerodromeListPlugin::QueueSave()
 {
-    if (dis->itemID == (UINT)-1) return;
-    int item = (int)dis->itemID;
-    if (item >= (int)visible_.size()) return;
-    const Airport& a = airports_[visible_[item]];
-    HDC dc = dis->hDC;
-    RECT rc = dis->rcItem;
-
-    bool selected = (dis->itemState & ODS_SELECTED) != 0;
-    bool hovered = item == hover_;
-    bool hasAsr = !a.asrs.empty();
-    bool active = !lastOpenedIcao_.empty() && a.icao == lastOpenedIcao_;
-
-    COLORREF bg = selected ? kSelected : hovered && hasAsr ? kHover : (item % 2 ? kBackAlt : kBack);
-    HBRUSH b = CreateSolidBrush(bg);
-    FillRect(dc, &rc, b);
-    DeleteObject(b);
-
-    if (active) {
-        RECT bar = {rc.left, rc.top + 3, rc.left + 3, rc.bottom - 3};
-        HBRUSH ab = CreateSolidBrush(kActive);
-        FillRect(dc, &bar, ab);
-        DeleteObject(ab);
-    }
-
-    SetBkMode(dc, TRANSPARENT);
-    RECT tr = rc;
-    tr.left += 10;
-
-    HGDIOBJ old = SelectObject(dc, fontBold_);
-    SetTextColor(dc, hasAsr ? (selected ? RGB(255, 255, 255) : kText) : kTextNoAsr);
-    std::wstring icao = Widen(a.icao);
-    DrawTextW(dc, icao.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-
-    SIZE sz;
-    GetTextExtentPoint32W(dc, L"WWWW", 4, &sz);
-    tr.left += sz.cx + 10;
-
-    if (a.asrs.size() > 1) {
-        // little "+n" badge for aerodromes with more than one ASR (right-click to choose)
-        SelectObject(dc, font_);
-        wchar_t badge[8];
-        swprintf_s(badge, L"+%d", (int)a.asrs.size() - 1);
-        RECT br = tr;
-        br.right -= 6;
-        SetTextColor(dc, kAccent);
-        DrawTextW(dc, badge, -1, &br, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
-        SIZE bsz;
-        GetTextExtentPoint32W(dc, badge, (int)wcslen(badge), &bsz);
-        tr.right -= bsz.cx + 12;
-    }
-
-    SelectObject(dc, font_);
-    SetTextColor(dc, hasAsr ? (selected ? RGB(220, 232, 245) : kTextDim) : kTextNoAsr);
-    std::wstring name = a.name.empty() ? (hasAsr ? L"" : L"no ASR") : Widen(a.name);
-    tr.right -= 6;
-    DrawTextW(dc, name.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-    SelectObject(dc, old);
+    // Restart a short timer on every change, so a burst of changes (dragging,
+    // scrolling) is written once, a moment after it stops.
+    if (hwnd_ && IsWindow(hwnd_)) SetTimer(hwnd_, kSaveTimer, kSaveDelayMs, nullptr);
+    else SaveNow();
 }
 
-void AerodromeListPlugin::ShowAsrMenu(int item, POINT screenPt)
+void AerodromeListPlugin::SaveNow()
 {
-    if (item < 0 || item >= (int)visible_.size()) return;
-    const Airport& a = airports_[visible_[item]];
-    HMENU menu = CreatePopupMenu();
-    if (a.asrs.empty()) {
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"No ASR files found");
-    } else {
-        for (size_t i = 0; i < a.asrs.size(); ++i) {
-            const std::wstring& p = a.asrs[i];
-            std::wstring label = p.substr(p.find_last_of(L'\\') + 1);
-            AppendMenuW(menu, MF_STRING, IDM_ASR_BASE + i, label.c_str());
-        }
+    if (hwnd_ && IsWindow(hwnd_)) {
+        KillTimer(hwnd_, kSaveTimer);
+        SaveRect();
     }
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, screenPt.x, screenPt.y, 0, hwnd_,
-                             nullptr);
-    DestroyMenu(menu);
-    if (cmd >= IDM_ASR_BASE) OpenItem(item, cmd - IDM_ASR_BASE);
+    settings_.SaveWindow();
+    settings_.SavePins();
 }
 
-LRESULT CALLBACK AerodromeListPlugin::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+LRESULT CALLBACK AerodromeListPlugin::FrameProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     AerodromeListPlugin* self;
     if (msg == WM_NCCREATE) {
@@ -978,52 +1022,151 @@ LRESULT CALLBACK AerodromeListPlugin::WndProc(HWND h, UINT msg, WPARAM wp, LPARA
         self = reinterpret_cast<AerodromeListPlugin*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     }
     if (!self) return DefWindowProcW(h, msg, wp, lp);
-    return self->HandleMessage(msg, wp, lp);
+    return self->HandleFrame(msg, wp, lp);
 }
 
-LRESULT AerodromeListPlugin::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
+LRESULT AerodromeListPlugin::HandleFrame(UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
-    case WM_SIZE:
-        Layout();
-        return 0;
-    case WM_EXITSIZEMOVE:
-        SaveRect();
-        settings_.Save();
-        return 0;
-    case WM_GETMINMAXINFO: {
-        auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-        mmi->ptMinTrackSize = {170, 140};
-        return 0;
-    }
-    case WM_CLOSE:
-        return 0; // stays on screen (Alt+F4 etc.); .adl hides it for the session if really needed
-    case WM_ERASEBKGND: {
+    case WM_NCHITTEST: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd_, &pt);
         RECT rc;
         GetClientRect(hwnd_, &rc);
-        FillRect((HDC)wp, &rc, backBrush_);
+        bool l = pt.x < kGrip, r = pt.x >= rc.right - kGrip;
+        bool t = pt.y < 3, b = !settings_.collapsed && pt.y >= rc.bottom - kGrip;
+        if (!settings_.collapsed) {
+            if (t && l) return HTTOPLEFT;
+            if (t && r) return HTTOPRIGHT;
+            if (b && l) return HTBOTTOMLEFT;
+            if (b && r) return HTBOTTOMRIGHT;
+            if (t) return HTTOP;
+            if (b) return HTBOTTOM;
+        }
+        if (l) return HTLEFT;
+        if (r) return HTRIGHT;
+        if (PtInRect(&headerRc_, pt) && ButtonAt(pt) == Button::None) return HTCAPTION;
+        return HTCLIENT;
+    }
+    case WM_NCLBUTTONDBLCLK:
+        if (wp == HTCAPTION) {
+            SetCollapsed(!settings_.collapsed);
+            return 0;
+        }
+        break;
+    case WM_GETMINMAXINFO: {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+        mmi->ptMinTrackSize = {170, settings_.collapsed ? kHeaderH + 2 : 110};
+        if (settings_.collapsed) mmi->ptMaxTrackSize.y = kHeaderH + 2;
+        return 0;
+    }
+    case WM_SIZE:
+        Layout();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        QueueSave();
+        return 0;
+    case WM_MOVE:
+        QueueSave();
+        return 0;
+    case WM_EXITSIZEMOVE:
+        SaveNow();
+        return 0;
+    case WM_TIMER:
+        if (wp == kSaveTimer) {
+            SaveNow();
+            return 0;
+        }
+        break;
+    case WM_DESTROY:
+        // Last chance: EuroScope closing destroys this window (it is owned by
+        // EuroScope's main window), possibly before the plug-in is unloaded.
+        SaveNow();
+        notifyHwnd_ = nullptr;
+        return 0;
+    case WM_NCDESTROY:
+        hwnd_ = nullptr;
+        filter_ = nullptr;
+        rows_ = nullptr;
+        return 0;
+    case WM_CLOSE:
+        return 0; // stays on screen (Alt+F4 etc.); .adl hides it for the session if really needed
+    case WM_ERASEBKGND:
         return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd_, &ps);
+        RECT rc;
+        GetClientRect(hwnd_, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ oldBmp = SelectObject(mem, bmp);
+        PaintFrame(mem);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(hwnd_, &ps);
+        return 0;
     }
     case WM_CTLCOLOREDIT:
-        SetTextColor((HDC)wp, kText);
-        SetBkColor((HDC)wp, kEditBack);
-        return (LRESULT)editBrush_;
-    case WM_CTLCOLORLISTBOX:
-        return (LRESULT)backBrush_;
-    case WM_MEASUREITEM:
-        reinterpret_cast<MEASUREITEMSTRUCT*>(lp)->itemHeight = itemHeight_;
-        return TRUE;
-    case WM_DRAWITEM:
-        DrawItem(reinterpret_cast<DRAWITEMSTRUCT*>(lp));
-        return TRUE;
+        SetTextColor((HDC)wp, kTextBright);
+        SetBkColor((HDC)wp, kField);
+        return (LRESULT)fieldBrush_;
+    case WM_LBUTTONDOWN: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        pressed_ = hot_ = ButtonAt(pt);
+        if (pressed_ != Button::None) {
+            SetCapture(hwnd_);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        } else if (PtInRect(&fieldRc_, pt)) {
+            SetFocus(filter_);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (pressed_ != Button::None) {
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            Button h = ButtonAt(pt);
+            if (h != hot_) {
+                hot_ = h;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP: {
+        Button b = pressed_;
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        pressed_ = hot_ = Button::None;
+        if (GetCapture() == hwnd_) ReleaseCapture();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (b != Button::None && ButtonAt(pt) == b) {
+            if (b == Button::Collapse) SetCollapsed(!settings_.collapsed);
+            if (b == Button::Master) OpenMaster();
+        }
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (pressed_ != Button::None) {
+            pressed_ = hot_ = Button::None;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (rows_) return SendMessageW(rows_, msg, wp, lp);
+        return 0;
+    case WM_SETFOCUS:
+        if (rows_ && !settings_.collapsed) SetFocus(rows_);
+        return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_FILTER && HIWORD(wp) == EN_CHANGE) {
+            top_ = 0;
             RebuildList();
             return 0;
         }
         break;
     case WM_APP_INDEX_READY:
         ApplyIndex();
+        InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     case WM_APP_OPEN_ITEM: {
         HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
@@ -1039,121 +1182,434 @@ LRESULT AerodromeListPlugin::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd_, msg, wp, lp);
 }
 
-LRESULT CALLBACK AerodromeListPlugin::ListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+// --- window: rows ---------------------------------------------------------------
+
+bool AerodromeListPlugin::HasScrollbar() const
 {
-    auto* self = reinterpret_cast<AerodromeListPlugin*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self->HandleListMessage(msg, wp, lp);
+    RECT rc;
+    GetClientRect(rows_, &rc);
+    return ContentHeight() > rc.bottom;
 }
 
-LRESULT AerodromeListPlugin::HandleListMessage(UINT msg, WPARAM wp, LPARAM lp)
+RECT AerodromeListPlugin::ThumbRect() const
 {
-    auto itemAt = [&](LPARAM pt) -> int {
-        LRESULT r = CallWindowProcW(listDefault_, list_, LB_ITEMFROMPOINT, 0, pt);
-        if (HIWORD(r)) return -1;
-        return (int)LOWORD(r);
-    };
-    auto invalidateItem = [&](int i) {
-        RECT r;
-        if (i >= 0 && CallWindowProcW(listDefault_, list_, LB_GETITEMRECT, i, (LPARAM)&r) != LB_ERR)
-            InvalidateRect(list_, &r, FALSE);
-    };
+    RECT rc;
+    GetClientRect(rows_, &rc);
+    int content = ContentHeight(), view = rc.bottom;
+    if (content <= view || view <= 0) return RECT{0, 0, 0, 0};
+    int thumbH = std::max(18, view * view / content);
+    int range = content - view;
+    int y = (int)((long long)top_ * (view - thumbH) / range);
+    return RECT{rc.right - kScrollW + 1, y, rc.right - 1, y + thumbH};
+}
 
+int AerodromeListPlugin::ItemAt(int y) const
+{
+    if (y < 0) return -1;
+    int i = (y + top_) / kRowH;
+    return i < RowCount() ? i : -1;
+}
+
+void AerodromeListPlugin::ScrollTo(int top)
+{
+    if (!rows_) return;
+    RECT rc;
+    GetClientRect(rows_, &rc);
+    int maxTop = std::max(0, ContentHeight() - (int)rc.bottom);
+    top = std::max(0, std::min(top, maxTop));
+    if (top != top_) {
+        top_ = top;
+        InvalidateRows();
+    }
+    // Remember where the full (unfiltered) list was scrolled to.
+    if (scrollRestored_ && filter_ && GetWindowTextLengthW(filter_) == 0 && settings_.scrollTop != top_) {
+        settings_.scrollTop = top_;
+        QueueSave();
+    }
+}
+
+// Put the list back where it was last time, once it actually has its rows
+// (ASR index loaded, sector read) and its real size (not collapsed).
+void AerodromeListPlugin::TryRestoreScroll()
+{
+    if (scrollRestored_ || !rows_ || !indexLoaded_ || RowCount() == 0 || settings_.collapsed) return;
+    if (filter_ && GetWindowTextLengthW(filter_) > 0) return;
+    scrollRestored_ = true;
+    ScrollTo(settings_.scrollTop);
+}
+
+void AerodromeListPlugin::EnsureVisible(int item)
+{
+    if (item < 0) return;
+    RECT rc;
+    GetClientRect(rows_, &rc);
+    int y = item * kRowH;
+    if (y < top_) ScrollTo(y);
+    else if (y + kRowH > top_ + rc.bottom) ScrollTo(y + kRowH - rc.bottom);
+}
+
+void AerodromeListPlugin::PaintRows(HDC dc, const RECT& rc)
+{
+    Fill(dc, rc, kBody);
+    SelectObject(dc, listFont_);
+
+    if (RowCount() == 0) {
+        std::wstring msg;
+        wchar_t text[8] = {};
+        if (filter_) GetWindowTextW(filter_, text, 8);
+        if (!indexLoaded_) msg = L"Loading...";
+        else if (text[0]) msg = L"No match - Enter opens an exact ICAO";
+        else msg = L"No aerodrome ASRs found";
+        RECT r = rc;
+        r.top += 8;
+        Text(dc, msg, r, kTextDim, DT_CENTER | DT_TOP | DT_END_ELLIPSIS);
+        return;
+    }
+
+    bool scroll = HasScrollbar();
+    int right = rc.right - (scroll ? kScrollW + 2 : 4);
+    SIZE icaoSize;
+    GetTextExtentPoint32W(dc, L"WWWW", 4, &icaoSize);
+
+    int first = top_ / kRowH;
+    int last = std::min(RowCount() - 1, (int)((top_ + rc.bottom) / kRowH));
+    for (int i = first; i <= last; ++i) {
+        const Airport& a = airports_[visible_[i]];
+        int y = i * kRowH - top_;
+        RECT row{0, y, rc.right, y + kRowH};
+        bool dragged = dragging_ && i == pressItem_;
+        COLORREF bg = (i == sel_ || dragged) ? kSelected : (i == hover_ ? kHover : kBody);
+        Fill(dc, row, bg);
+
+        bool pinned = i < pinnedVisible_;
+        DrawPin(dc, kPinW / 2, y + kRowH / 2, pinned, i == hover_ && hoverPin_);
+
+        bool active = !lastOpenedIcao_.empty() && a.icao == lastOpenedIcao_;
+        RECT ir{kPinW, y, kPinW + icaoSize.cx + 2, y + kRowH};
+        Text(dc, Widen(a.icao), ir, active ? kActive : kTextBright, DT_LEFT | DT_VCENTER);
+
+        RECT nr{ir.right + 8, y, right, y + kRowH};
+        if (a.asrs.size() > 1) {
+            wchar_t badge[8];
+            swprintf_s(badge, L"+%d", (int)a.asrs.size() - 1);
+            SIZE bs;
+            GetTextExtentPoint32W(dc, badge, (int)wcslen(badge), &bs);
+            RECT br{right - bs.cx, y, right, y + kRowH};
+            Text(dc, badge, br, kTextDim, DT_RIGHT | DT_VCENTER);
+            nr.right = br.left - 6;
+        }
+        Text(dc, Widen(a.name), nr, kTextDim, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+
+    // separator between pinned and the rest
+    if (pinnedVisible_ > 0 && pinnedVisible_ < RowCount()) {
+        int y = pinnedVisible_ * kRowH - top_;
+        HLine(dc, 0, rc.right, y - 1, kBevelMid);
+    }
+
+    // drop position while dragging
+    if (dragging_ && dropSlot_ >= 0) {
+        int y = dropSlot_ * kRowH - top_;
+        RECT line{kPinW - 4, y - 1, right, y + 1};
+        Fill(dc, line, kPinOn);
+    }
+
+    // scrollbar
+    if (scroll) {
+        RECT track{rc.right - kScrollW, 0, rc.right, rc.bottom};
+        Fill(dc, track, kStrip);
+        VLine(dc, track.left, 0, rc.bottom, kBevelDark);
+        RECT thumb = ThumbRect();
+        Bevel(dc, thumb, thumbDrag_ ? kBevelLight : kButton, true);
+    }
+}
+
+void AerodromeListPlugin::ShowContextMenu(int item, POINT screenPt)
+{
+    if (item < 0 || item >= RowCount()) return;
+    // Copies: EuroScope's timer may rebuild the list while the menu is open.
+    const std::string icao = airports_[visible_[item]].icao;
+    const std::vector<std::wstring> asrs = airports_[visible_[item]].asrs;
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, IDM_PIN, IsPinned(icao) ? L"Unpin" : L"Pin to top");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    for (size_t i = 0; i < asrs.size(); ++i) {
+        const std::wstring& p = asrs[i];
+        std::wstring label = L"Open " + p.substr(p.find_last_of(L'\\') + 1);
+        AppendMenuW(menu, MF_STRING, IDM_ASR_BASE + i, label.c_str());
+    }
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, screenPt.x, screenPt.y, 0, hwnd_,
+                             nullptr);
+    DestroyMenu(menu);
+    if (cmd == IDM_PIN) TogglePin(icao);
+    else if (cmd >= IDM_ASR_BASE) OpenIcao(icao, cmd - IDM_ASR_BASE);
+}
+
+LRESULT CALLBACK AerodromeListPlugin::RowsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    AerodromeListPlugin* self;
+    if (msg == WM_NCCREATE) {
+        self = static_cast<AerodromeListPlugin*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)self);
+        self->rows_ = h;
+    } else {
+        self = reinterpret_cast<AerodromeListPlugin*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    }
+    if (!self) return DefWindowProcW(h, msg, wp, lp);
+    return self->HandleRows(msg, wp, lp);
+}
+
+LRESULT AerodromeListPlugin::HandleRows(UINT msg, WPARAM wp, LPARAM lp)
+{
     switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(rows_, &ps);
+        RECT rc;
+        GetClientRect(rows_, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, std::max(1, (int)rc.right), std::max(1, (int)rc.bottom));
+        HGDIOBJ oldBmp = SelectObject(mem, bmp);
+        PaintRows(mem, rc);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(rows_, &ps);
+        return 0;
+    }
+    case WM_SIZE:
+        ScrollTo(top_);
+        InvalidateRows();
+        return 0;
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        ScrollTo(top_ - delta * kRowH * 3 / WHEEL_DELTA);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        SetFocus(rows_);
+        RECT thumb = ThumbRect();
+        RECT rc;
+        GetClientRect(rows_, &rc);
+        if (HasScrollbar() && pt.x >= rc.right - kScrollW) {
+            if (PtInRect(&thumb, pt)) {
+                thumbDrag_ = true;
+                thumbGrab_ = pt.y - thumb.top;
+                SetCapture(rows_);
+            } else {
+                ScrollTo(top_ + (pt.y < thumb.top ? -rc.bottom : rc.bottom)); // page
+            }
+            InvalidateRows();
+            return 0;
+        }
+        int i = ItemAt(pt.y);
+        if (i < 0) return 0;
+        sel_ = i;
+        if (pt.x < kPinW) {
+            TogglePin(airports_[visible_[i]].icao);
+            return 0;
+        }
+        pressItem_ = i;
+        pressPt_ = pt;
+        dragging_ = false;
+        dropSlot_ = -1;
+        SetCapture(rows_);
+        InvalidateRows();
+        return 0;
+    }
     case WM_MOUSEMOVE: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (!trackingMouse_) {
-            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, list_, 0};
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, rows_, 0};
             TrackMouseEvent(&tme);
             trackingMouse_ = true;
         }
-        int i = itemAt(lp);
-        if (i != hover_) {
-            int old = hover_;
-            hover_ = i;
-            invalidateItem(old);
-            invalidateItem(i);
-            bool clickable = i >= 0 && i < (int)visible_.size() && !airports_[visible_[i]].asrs.empty();
-            SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
+        RECT rc;
+        GetClientRect(rows_, &rc);
+        if (thumbDrag_) {
+            int content = ContentHeight(), view = rc.bottom;
+            RECT thumb = ThumbRect();
+            int thumbH = thumb.bottom - thumb.top;
+            if (view > thumbH)
+                ScrollTo((int)((long long)(pt.y - thumbGrab_) * (content - view) / (view - thumbH)));
+            return 0;
         }
-        break;
-    }
-    case WM_SETCURSOR: {
-        if (LOWORD(lp) != HTCLIENT) break;
-        bool clickable = hover_ >= 0 && hover_ < (int)visible_.size() && !airports_[visible_[hover_]].asrs.empty();
-        SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
-        return TRUE;
-    }
-    case WM_MOUSELEAVE: {
-        trackingMouse_ = false;
-        int old = hover_;
-        hover_ = -1;
-        invalidateItem(old);
-        break;
-    }
-    case WM_LBUTTONDOWN:
-        pressedItem_ = itemAt(lp);
-        break;
-    case WM_LBUTTONUP: {
-        LRESULT r = CallWindowProcW(listDefault_, list_, msg, wp, lp);
-        int i = itemAt(lp);
-        if (i >= 0 && i == pressedItem_) PostMessageW(hwnd_, WM_APP_OPEN_ITEM, i, -1);
-        pressedItem_ = -1;
-        return r;
-    }
-    case WM_LBUTTONDBLCLK:
-        return 0; // a single click already opens; ignore the second click
-    case WM_RBUTTONUP: {
-        int i = itemAt(lp);
-        if (i >= 0) {
-            CallWindowProcW(listDefault_, list_, LB_SETCURSEL, i, 0);
-            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            ClientToScreen(list_, &pt);
-            ShowAsrMenu(i, pt);
+        if (pressItem_ >= 0 && GetCapture() == rows_) {
+            // Pinned aerodromes can be dragged up and down to reorder them.
+            if (!dragging_ && pressItem_ < pinnedVisible_ && abs(pt.y - pressPt_.y) > 4) dragging_ = true;
+            if (dragging_) {
+                if (pt.y < 0) ScrollTo(top_ - kRowH);
+                if (pt.y > rc.bottom) ScrollTo(top_ + kRowH);
+                int slot = (pt.y + top_ + kRowH / 2) / kRowH;
+                dropSlot_ = std::max(0, std::min(slot, pinnedVisible_));
+                SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+                InvalidateRows();
+                return 0;
+            }
+        }
+        int i = ItemAt(pt.y);
+        bool onPin = i >= 0 && pt.x < kPinW;
+        if (pt.x >= rc.right - (HasScrollbar() ? kScrollW : 0)) i = -1;
+        if (i != hover_ || onPin != hoverPin_) {
+            hover_ = i;
+            hoverPin_ = onPin;
+            InvalidateRows();
         }
         return 0;
     }
-    case WM_KEYDOWN:
-        if (wp == VK_RETURN) {
-            int sel = (int)CallWindowProcW(listDefault_, list_, LB_GETCURSEL, 0, 0);
-            if (sel >= 0) PostMessageW(hwnd_, WM_APP_OPEN_ITEM, sel, -1);
-            return 0;
-        }
-        if (wp == VK_ESCAPE) {
-            PostMessageW(hwnd_, WM_APP_RETURN_FOCUS, 0, 0);
-            return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            SetCursor(LoadCursorW(nullptr, dragging_ ? IDC_SIZENS : (hover_ >= 0 ? IDC_HAND : IDC_ARROW)));
+            return TRUE;
         }
         break;
-    case WM_GETDLGCODE:
-        return DLGC_WANTALLKEYS;
+    case WM_MOUSELEAVE:
+        trackingMouse_ = false;
+        if (hover_ != -1) {
+            hover_ = -1;
+            hoverPin_ = false;
+            InvalidateRows();
+        }
+        return 0;
+    case WM_LBUTTONUP: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        bool wasThumb = thumbDrag_;
+        bool wasDrag = dragging_;
+        int pressed = pressItem_;
+        int slot = dropSlot_;
+        // Clear the state before releasing capture: ReleaseCapture() sends
+        // WM_CAPTURECHANGED synchronously.
+        thumbDrag_ = false;
+        dragging_ = false;
+        pressItem_ = -1;
+        dropSlot_ = -1;
+        if (GetCapture() == rows_) ReleaseCapture();
+        if (wasThumb) {
+            InvalidateRows();
+            return 0;
+        }
+        // A pinned row released somewhere else counts as a drag, even if the
+        // individual mouse moves were merged away.
+        if (!wasDrag && pressed >= 0 && pressed < pinnedVisible_ && abs(pt.y - pressPt_.y) > 4) {
+            slot = std::max(0, std::min((int)((pt.y + top_ + kRowH / 2) / kRowH), pinnedVisible_));
+            wasDrag = true;
+        }
+        if (wasDrag) {
+            ApplyDrop(pressed, slot);
+        } else if (pressed >= 0 && ItemAt(pt.y) == pressed && pt.x >= kPinW) {
+            PostMessageW(hwnd_, WM_APP_OPEN_ITEM, pressed, -1);
+        }
+        InvalidateRows();
+        return 0;
     }
-    return CallWindowProcW(listDefault_, list_, msg, wp, lp);
+    case WM_CAPTURECHANGED:
+        if (thumbDrag_ || dragging_) {
+            thumbDrag_ = false;
+            dragging_ = false;
+            pressItem_ = -1;
+            dropSlot_ = -1;
+            InvalidateRows();
+        }
+        return 0;
+    case WM_RBUTTONUP: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        int i = ItemAt(pt.y);
+        if (i >= 0) {
+            sel_ = i;
+            InvalidateRows();
+            ClientToScreen(rows_, &pt);
+            ShowContextMenu(i, pt);
+        }
+        return 0;
+    }
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS | DLGC_WANTCHARS;
+    case WM_KEYDOWN: {
+        RECT rc;
+        GetClientRect(rows_, &rc);
+        int page = std::max(1, (int)rc.bottom / kRowH - 1);
+        int n = RowCount();
+        int next = sel_;
+        switch (wp) {
+        case VK_UP: next = sel_ <= 0 ? 0 : sel_ - 1; break;
+        case VK_DOWN: next = sel_ < 0 ? 0 : std::min(n - 1, sel_ + 1); break;
+        case VK_PRIOR: next = std::max(0, sel_ - page); break;
+        case VK_NEXT: next = std::min(n - 1, std::max(0, sel_) + page); break;
+        case VK_HOME: next = 0; break;
+        case VK_END: next = n - 1; break;
+        case VK_RETURN:
+            if (sel_ >= 0) PostMessageW(hwnd_, WM_APP_OPEN_ITEM, sel_, -1);
+            return 0;
+        case VK_ESCAPE:
+            PostMessageW(hwnd_, WM_APP_RETURN_FOCUS, 0, 0);
+            return 0;
+        default:
+            return 0;
+        }
+        if (n > 0 && next != sel_) {
+            sel_ = next;
+            EnsureVisible(sel_);
+            InvalidateRows();
+        }
+        return 0;
+    }
+    case WM_CHAR:
+        // typing while the list has focus goes to the search field
+        if (wp >= 0x20 && wp != 0x7F) {
+            SetFocus(filter_);
+            SendMessageW(filter_, EM_SETSEL, -1, -1);
+            SendMessageW(filter_, WM_CHAR, wp, lp);
+        }
+        return 0;
+    }
+    return DefWindowProcW(rows_, msg, wp, lp);
 }
+
+// --- window: search field ---------------------------------------------------------
 
 LRESULT CALLBACK AerodromeListPlugin::FilterProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     auto* self = reinterpret_cast<AerodromeListPlugin*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self->HandleFilterMessage(msg, wp, lp);
+    return self->HandleFilter(msg, wp, lp);
 }
 
-LRESULT AerodromeListPlugin::HandleFilterMessage(UINT msg, WPARAM wp, LPARAM lp)
+LRESULT AerodromeListPlugin::HandleFilter(UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (msg == WM_KEYDOWN) {
+    switch (msg) {
+    case WM_KEYDOWN:
         if (wp == VK_RETURN) {
-            // open the selected entry, or the first one that has an ASR
-            int sel = (int)SendMessageW(list_, LB_GETCURSEL, 0, 0);
-            if (sel < 0) {
-                for (int i = 0; i < (int)visible_.size(); ++i) {
-                    if (!airports_[visible_[i]].asrs.empty()) {
-                        sel = i;
-                        break;
-                    }
-                }
+            wchar_t text[64] = {};
+            GetWindowTextW(filter_, text, 64);
+            std::string typed = Upper(Narrow(text));
+            while (!typed.empty() && typed.back() == ' ') typed.pop_back();
+            while (!typed.empty() && typed.front() == ' ') typed.erase(typed.begin());
+
+            // A complete ICAO opens that aerodrome's ASR straight away.
+            if (typed.size() == 4 && index_.asrByIcao.count(typed)) {
+                SetWindowTextW(filter_, L"");
+                OpenIcao(typed, -1);
+                return 0;
             }
-            if (sel >= 0) PostMessageW(hwnd_, WM_APP_OPEN_ITEM, sel, -1);
+            // Otherwise open the highlighted entry, or the first match.
+            int item = sel_ >= 0 ? sel_ : (RowCount() > 0 ? 0 : -1);
+            if (item >= 0) {
+                SetWindowTextW(filter_, L"");
+                std::string icao = airports_[visible_[item]].icao;
+                OpenIcao(icao, -1);
+            } else if (!typed.empty()) {
+                Message("No ASR found for " + typed + ".");
+            }
             return 0;
         }
-        if (wp == VK_DOWN && !visible_.empty()) {
-            SetFocus(list_);
-            if (SendMessageW(list_, LB_GETCURSEL, 0, 0) < 0) SendMessageW(list_, LB_SETCURSEL, 0, 0);
+        if (wp == VK_DOWN && RowCount() > 0) {
+            SetFocus(rows_);
+            if (sel_ < 0) sel_ = 0;
+            EnsureVisible(sel_);
+            InvalidateRows();
             return 0;
         }
         if (wp == VK_ESCAPE) {
@@ -1161,8 +1617,31 @@ LRESULT AerodromeListPlugin::HandleFilterMessage(UINT msg, WPARAM wp, LPARAM lp)
             PostMessageW(hwnd_, WM_APP_RETURN_FOCUS, 0, 0);
             return 0;
         }
+        break;
+    case WM_CHAR:
+        if (wp == VK_RETURN || wp == VK_ESCAPE) return 0; // no beep
+        break;
+    case WM_MOUSEWHEEL:
+        return SendMessageW(rows_, msg, wp, lp);
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        InvalidateRect(filter_, nullptr, TRUE);
+        break;
+    case WM_PAINT: {
+        LRESULT r = CallWindowProcW(filterDefault_, filter_, msg, wp, lp);
+        // placeholder text when empty and not being typed into
+        if (GetWindowTextLengthW(filter_) == 0 && GetFocus() != filter_) {
+            HDC dc = GetDC(filter_);
+            RECT rc;
+            GetClientRect(filter_, &rc);
+            HGDIOBJ old = SelectObject(dc, listFont_);
+            Text(dc, L"Search ICAO / name", rc, kTextDim, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+            SelectObject(dc, old);
+            ReleaseDC(filter_, dc);
+        }
+        return r;
     }
-    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0; // no beep
+    }
     return CallWindowProcW(filterDefault_, filter_, msg, wp, lp);
 }
 

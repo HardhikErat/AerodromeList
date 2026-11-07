@@ -1,6 +1,7 @@
 #include "AsrOpener.h"
 
 #include <windows.h>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -24,8 +25,9 @@ namespace {
 //   mov    ecx,dword ptr [eax]  ; manager 8B 08
 //   call   OpenOrActivateAsr              E8 ?? ?? ?? ??
 //
-// OpenOrActivateAsr(const char* path) walks the list of open ASRs; if one with
-// the same path is open it is activated, otherwise the file is opened.
+// OpenOrActivateAsr(const char* path) walks the manager's list of open ASRs
+// (manager+0x0C -> std::list; node+8 -> ASR object; ASR+8 -> CString path).
+// If one has the same path it is activated, otherwise the file is opened.
 
 const int kWild = -1;
 const int kCallPattern[] = {0xE8, kWild, kWild, kWild, kWild, 0x8D, 0x4D, kWild, 0x51, 0x8B, 0xC8,
@@ -34,11 +36,22 @@ const int kCallPattern[] = {0xE8, kWild, kWild, kWild, kWild, 0x8D, 0x4D, kWild,
 const size_t kCallPatternLen = sizeof(kCallPattern) / sizeof(kCallPattern[0]);
 
 // push ebp / mov ebp,esp / push ebx / mov ebx,[ebp+8] / push esi / push edi / mov edi,ecx
-const uint8_t kOpenPrologue[] = {0x55, 0x8B, 0xEC, 0x53, 0x8B, 0x5D, 0x08, 0x56, 0x57, 0x8B, 0xF9};
+// mov eax,[edi+0Ch] / mov esi,[eax] / cmp esi,eax / je xx / mov ecx,[esi+8] / add ecx,8
+// The second line pins down the list layout used by OpenAsrPaths().
+const int kOpenPrologue[] = {0x55, 0x8B, 0xEC, 0x53, 0x8B, 0x5D, 0x08, 0x56, 0x57, 0x8B, 0xF9,
+                             0x8B, 0x47, 0x0C, 0x8B, 0x30, 0x3B, 0xF0, 0x74, kWild, 0x8B, 0x4E,
+                             0x08, 0x83, 0xC1, 0x08};
+const size_t kOpenPrologueLen = sizeof(kOpenPrologue) / sizeof(kOpenPrologue[0]);
+const size_t kListOffset = 0x0C; // manager -> list head
+const size_t kNodeValue = 0x08;  // list node -> ASR object
+const size_t kAsrPath = 0x08;    // ASR object -> CString (char*)
+
 // push ebp / mov ebp,esp
 const uint8_t kFramePrologue[] = {0x55, 0x8B, 0xEC};
 
 const size_t kMaxDistanceFromString = 0x100;
+const int kMaxOpenAsrs = 64;
+const int kMaxPath = 520;
 
 struct SharedPtrRaw {
     void* object;
@@ -55,6 +68,13 @@ GetApplicationFn g_getApplication = nullptr;
 GetAsrManagerFn g_getAsrManager = nullptr;
 OpenOrActivateFn g_openOrActivate = nullptr;
 bool g_initialised = false;
+
+// Scratch buffer for the open-ASR list (UI thread only).
+struct OpenList {
+    int count;
+    char paths[kMaxOpenAsrs][kMaxPath];
+};
+OpenList g_openList;
 
 struct Section {
     uint8_t* begin = nullptr;
@@ -108,36 +128,85 @@ void CollectSections(HMODULE module, std::vector<Section>& code, std::vector<Sec
     }
 }
 
-// Calls the located routines. Only POD locals here so that SEH can be used.
+void ReleaseShared(SharedPtrRaw& holder)
+{
+    // Release our copy of the shared_ptr exactly like std::shared_ptr would.
+    if (!holder.control) return;
+    auto* counts = reinterpret_cast<volatile long*>(holder.control);
+    void** vtable = *reinterpret_cast<void***>(holder.control);
+    if (InterlockedDecrement(&counts[1]) == 0) {
+        reinterpret_cast<RefCountVirtualFn>(vtable[0])(holder.control, nullptr);
+        if (InterlockedDecrement(&counts[2]) == 0) {
+            reinterpret_cast<RefCountVirtualFn>(vtable[1])(holder.control, nullptr);
+        }
+    }
+    holder.control = nullptr;
+}
+
+// --- SEH-guarded calls (POD locals only) --------------------------------------
+
 int CallOpenGuarded(const char* path)
 {
     __try {
         void* app = g_getApplication();
-        if (!app) {
-            return 0;
-        }
+        if (!app) return 0;
         SharedPtrRaw holder = {nullptr, nullptr};
         SharedPtrRaw* sp = g_getAsrManager(app, nullptr, &holder);
         void* manager = sp ? sp->object : nullptr;
-        bool ok = false;
-        if (manager) {
-            ok = g_openOrActivate(manager, nullptr, path);
-        }
-        // Release our copy of the shared_ptr exactly like std::shared_ptr would.
-        if (holder.control) {
-            auto* counts = reinterpret_cast<volatile long*>(holder.control);
-            void** vtable = *reinterpret_cast<void***>(holder.control);
-            if (InterlockedDecrement(&counts[1]) == 0) {
-                reinterpret_cast<RefCountVirtualFn>(vtable[0])(holder.control, nullptr);
-                if (InterlockedDecrement(&counts[2]) == 0) {
-                    reinterpret_cast<RefCountVirtualFn>(vtable[1])(holder.control, nullptr);
-                }
-            }
-        }
+        bool ok = manager ? g_openOrActivate(manager, nullptr, path) : false;
+        ReleaseShared(holder);
         return ok ? 1 : 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
+}
+
+int ReadOpenListGuarded()
+{
+    g_openList.count = 0;
+    __try {
+        void* app = g_getApplication();
+        if (!app) return 0;
+        SharedPtrRaw holder = {nullptr, nullptr};
+        SharedPtrRaw* sp = g_getAsrManager(app, nullptr, &holder);
+        uint8_t* manager = sp ? static_cast<uint8_t*>(sp->object) : nullptr;
+        if (manager) {
+            uint8_t* head = *reinterpret_cast<uint8_t**>(manager + kListOffset);
+            uint8_t* node = head ? *reinterpret_cast<uint8_t**>(head) : nullptr;
+            while (node && node != head && g_openList.count < kMaxOpenAsrs) {
+                uint8_t* asr = *reinterpret_cast<uint8_t**>(node + kNodeValue);
+                const char* text = asr ? *reinterpret_cast<const char**>(asr + kAsrPath) : nullptr;
+                char* out = g_openList.paths[g_openList.count];
+                int n = 0;
+                if (text) {
+                    while (n < kMaxPath - 1 && text[n]) {
+                        out[n] = text[n];
+                        ++n;
+                    }
+                }
+                out[n] = 0;
+                ++g_openList.count;
+                node = *reinterpret_cast<uint8_t**>(node);
+            }
+        }
+        ReleaseShared(holder);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_openList.count = 0;
+        return -1;
+    }
+}
+
+std::string Normalise(const std::string& p)
+{
+    std::string r = p;
+    for (char& c : r) c = (c == '/') ? '\\' : (char)toupper((unsigned char)c);
+    return r;
+}
+
+bool IsAbsolute(const std::string& p)
+{
+    return (p.size() > 2 && p[1] == ':') || (p.size() > 1 && p[0] == '\\' && p[1] == '\\');
 }
 
 } // namespace
@@ -186,13 +255,12 @@ bool Initialise(std::string& diagnostic)
                         uint8_t* getApp = CallTarget(q);
                         uint8_t* getMgr = CallTarget(q + 11);
                         uint8_t* open = CallTarget(q + 25);
-                        if (!Contains(c, getApp, 8) || !Contains(c, getMgr, 8) ||
-                            !Contains(c, open, sizeof(kOpenPrologue))) {
+                        if (!Contains(c, getApp, 8) || !Contains(c, getMgr, 8) || !Contains(c, open, kOpenPrologueLen)) {
                             continue;
                         }
                         if (std::memcmp(getApp, kFramePrologue, sizeof(kFramePrologue)) != 0 ||
                             std::memcmp(getMgr, kFramePrologue, sizeof(kFramePrologue)) != 0 ||
-                            std::memcmp(open, kOpenPrologue, sizeof(kOpenPrologue)) != 0) {
+                            !MatchAt(open, kOpenPrologue, kOpenPrologueLen)) {
                             continue;
                         }
                         g_getApplication = reinterpret_cast<GetApplicationFn>(getApp);
@@ -220,12 +288,48 @@ bool Available()
     return g_initialised;
 }
 
+bool SamePath(const std::string& stored, const std::string& absolute)
+{
+    if (stored.empty()) return false;
+    std::string s = Normalise(stored);
+    std::string a = Normalise(absolute);
+    if (s == a) return true;
+    if (IsAbsolute(s)) return false;
+    // Profile-relative, e.g. "\VABF\ASR\MASTER.ASR": match on the tail.
+    if (s[0] != '\\') s = "\\" + s;
+    return a.size() > s.size() && a.compare(a.size() - s.size(), s.size(), s) == 0;
+}
+
+bool OpenAsrPaths(std::vector<std::string>& paths)
+{
+    paths.clear();
+    if (!g_initialised) return false;
+    if (ReadOpenListGuarded() < 0) return false;
+    for (int i = 0; i < g_openList.count; ++i) paths.emplace_back(g_openList.paths[i]);
+    return true;
+}
+
 Result Open(const std::string& asrPath)
 {
     if (!g_initialised) {
         return Result::NotAvailable;
     }
-    int r = CallOpenGuarded(asrPath.c_str());
+
+    // If EuroScope already has this ASR open (possibly under a profile-relative
+    // path), pass its own spelling so it switches to that tab instead of
+    // opening a second copy.
+    std::string target = asrPath;
+    std::vector<std::string> open;
+    if (OpenAsrPaths(open)) {
+        for (const std::string& p : open) {
+            if (SamePath(p, asrPath)) {
+                target = p;
+                break;
+            }
+        }
+    }
+
+    int r = CallOpenGuarded(target.c_str());
     if (r < 0) {
         // Never try again after a fault.
         g_initialised = false;
