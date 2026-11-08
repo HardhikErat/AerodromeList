@@ -32,7 +32,7 @@ using namespace adl;
 namespace {
 
 const char* const kPluginName = "Aerodrome List";
-const char* const kPluginVersion = "1.2.0";
+const char* const kPluginVersion = "1.2.1";
 const char* const kPluginAuthor = "Hardhik Erat";
 const char* const kPluginLicense = "Free to use";
 
@@ -42,12 +42,10 @@ const UINT WM_APP_RETURN_FOCUS = WM_APP + 3;
 const UINT WM_APP_RUNWAY = WM_APP + 4; // wParam = panel row, lParam = 1 for DEP / 0 for ARR
 
 const int IDC_FILTER = 1001;
-const int IDM_PIN = 1900;
-const int IDM_RUNWAYS = 1901;
-const int IDM_ASR_BASE = 2000;
 
 const wchar_t* const kFrameClass = L"AerodromeListPluginWindow";
 const wchar_t* const kRowsClass = L"AerodromeListPluginRows";
+const wchar_t* const kBoxClass = L"AerodromeListPluginNameBox";
 
 // --- Look: matches EuroScope's built-in lists ----------------------------------
 
@@ -82,6 +80,8 @@ const int kChipW = 34;
 const int kChipH = 13;
 const int kChipDepX = 50;     // chip positions inside the runway panel
 const int kChipArrX = 88;
+const int kBoxPad = 6;       // right-click name box
+const int kBoxLineH = 18;
 
 const COLORREF kRunwayText = RGB(110, 190, 230);
 const COLORREF kDepOn = RGB(46, 125, 70);
@@ -358,7 +358,10 @@ private:
     void TryRestoreScroll();
     void EnsureVisible(int item);
     void InvalidateRows() { if (rows_) InvalidateRect(rows_, nullptr, FALSE); }
-    void ShowContextMenu(int item, POINT screenPt);
+    void ShowNameBox(int item, POINT screenPt);
+    void CloseNameBox();
+    static LRESULT CALLBACK NameBoxProc(HWND, UINT, WPARAM, LPARAM);
+    LRESULT HandleNameBox(HWND, UINT, WPARAM, LPARAM);
 
     // data
     void StartIndexing();
@@ -402,6 +405,15 @@ private:
     RECT headerRc_{}, collapseRc_{}, masterRc_{}, fieldRc_{}, rowsRc_{};
     RECT panelRc_{}, panelCloseRc_{}, panelDialogRc_{}; // runway panel (empty when closed)
     bool runwayBusy_ = false;
+
+    // right-click name box
+    HWND nameBox_ = nullptr;
+    struct {
+        std::string icao;
+        std::wstring name;
+        std::vector<std::wstring> asrs; // listed only when there is more than one
+        int hover = -1;
+    } box_;
     Button pressed_ = Button::None;
     Button hot_ = Button::None;
     int expandedHeight_ = 0;
@@ -480,6 +492,7 @@ AerodromeListPlugin::~AerodromeListPlugin()
 {
     notifyHwnd_ = nullptr;
     if (indexThread_.joinable()) indexThread_.join();
+    CloseNameBox();
     if (hwnd_ && IsWindow(hwnd_)) {
         DestroyWindow(hwnd_); // WM_DESTROY writes the final state
     } else {
@@ -489,6 +502,7 @@ AerodromeListPlugin::~AerodromeListPlugin()
     // The classes point at code in this DLL; unregister them so a reload re-registers cleanly.
     UnregisterClassW(kFrameClass, ThisModule());
     UnregisterClassW(kRowsClass, ThisModule());
+    UnregisterClassW(kBoxClass, ThisModule());
     for (HGDIOBJ o : {(HGDIOBJ)titleFont_, (HGDIOBJ)listFont_, (HGDIOBJ)buttonFont_, (HGDIOBJ)fieldBrush_})
         if (o) DeleteObject(o);
 }
@@ -962,6 +976,15 @@ void AerodromeListPlugin::EnsureWindow()
         wc.hInstance = inst;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.lpszClassName = kRowsClass;
+        RegisterClassExW(&wc);
+    }
+    if (!GetClassInfoExW(inst, kBoxClass, &wc)) {
+        wc = WNDCLASSEXW{sizeof(wc)};
+        wc.lpfnWndProc = &AerodromeListPlugin::NameBoxProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kBoxClass;
+        wc.style = CS_DROPSHADOW;
         RegisterClassExW(&wc);
     }
 
@@ -1673,18 +1696,7 @@ void AerodromeListPlugin::PaintRows(HDC dc, const RECT& rc)
         std::wstring summary = RunwaySummary(a.icao);
         if (!summary.empty()) Text(dc, summary, sr, kRunwayText, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
         else if (i == hover_ && !hoverPin_) Text(dc, L"RWY", sr, kTextDim, DT_RIGHT | DT_VCENTER);
-
-        RECT nr{ir.right + 8, y, sr.left - 6, y + kRowH};
-        if (a.asrs.size() > 1) {
-            wchar_t badge[8];
-            swprintf_s(badge, L"+%d", (int)a.asrs.size() - 1);
-            SIZE bs;
-            GetTextExtentPoint32W(dc, badge, (int)wcslen(badge), &bs);
-            RECT br{nr.right - bs.cx, y, nr.right, y + kRowH};
-            Text(dc, badge, br, kTextDim, DT_RIGHT | DT_VCENTER);
-            nr.right = br.left - 6;
-        }
-        Text(dc, Widen(a.name), nr, kTextDim, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        // The aerodrome's name is shown on right-click (see ShowNameBox).
     }
 
     // separator between pinned and the rest
@@ -1710,27 +1722,171 @@ void AerodromeListPlugin::PaintRows(HDC dc, const RECT& rc)
     }
 }
 
-void AerodromeListPlugin::ShowContextMenu(int item, POINT screenPt)
+// --- right-click: dark box with the aerodrome's name ------------------------------
+
+void AerodromeListPlugin::ShowNameBox(int item, POINT screenPt)
 {
+    CloseNameBox();
     if (item < 0 || item >= RowCount()) return;
-    // Copies: EuroScope's timer may rebuild the list while the menu is open.
-    const std::string icao = airports_[visible_[item]].icao;
-    const std::vector<std::wstring> asrs = airports_[visible_[item]].asrs;
-    HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, IDM_PIN, IsPinned(icao) ? L"Unpin" : L"Pin to top");
-    AppendMenuW(menu, MF_STRING, IDM_RUNWAYS, L"Active runways...");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    for (size_t i = 0; i < asrs.size(); ++i) {
-        const std::wstring& p = asrs[i];
-        std::wstring label = L"Open " + p.substr(p.find_last_of(L'\\') + 1);
-        AppendMenuW(menu, MF_STRING, IDM_ASR_BASE + i, label.c_str());
+    // Copies: EuroScope's timer may rebuild the list while the box is open.
+    const Airport& a = airports_[visible_[item]];
+    box_.icao = a.icao;
+    box_.name = a.name.empty() ? L"(no name in ICAO_Airports.txt)" : Widen(a.name);
+    box_.asrs.clear();
+    if (a.asrs.size() > 1) {
+        for (const std::wstring& p : a.asrs) box_.asrs.push_back(p.substr(p.find_last_of(L'\\') + 1));
     }
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, screenPt.x, screenPt.y, 0, hwnd_,
-                             nullptr);
-    DestroyMenu(menu);
-    if (cmd == IDM_PIN) TogglePin(icao);
-    else if (cmd == IDM_RUNWAYS) SetRunwayPanel(icao);
-    else if (cmd >= IDM_ASR_BASE) OpenIcao(icao, cmd - IDM_ASR_BASE);
+    box_.hover = -1;
+
+    // Size to the text.
+    HDC dc = GetDC(nullptr);
+    HGDIOBJ old = SelectObject(dc, listFont_);
+    SIZE icao{}, name{}, space{};
+    GetTextExtentPoint32W(dc, L"WWWW", 4, &icao);
+    GetTextExtentPoint32W(dc, box_.name.c_str(), (int)box_.name.size(), &name);
+    GetTextExtentPoint32W(dc, L"  ", 2, &space);
+    int w = icao.cx + space.cx + name.cx;
+    for (const std::wstring& f : box_.asrs) {
+        SIZE s{};
+        std::wstring label = L"Open " + f;
+        GetTextExtentPoint32W(dc, label.c_str(), (int)label.size(), &s);
+        w = std::max(w, (int)s.cx);
+    }
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+
+    const int pad = kBoxPad;
+    int width = std::min(std::max(w + 2 * pad + 2, 120), 460);
+    int height = 2 * pad + kBoxLineH + (box_.asrs.empty() ? 0 : 5 + (int)box_.asrs.size() * kBoxLineH) + 2;
+
+    // Next to the pointer, kept on the monitor.
+    HMONITOR mon = MonitorFromPoint(screenPt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(mon, &mi);
+    int x = std::min((int)screenPt.x + 6, (int)mi.rcWork.right - width);
+    int y = std::min((int)screenPt.y + 6, (int)mi.rcWork.bottom - height);
+    x = std::max(x, (int)mi.rcWork.left);
+    y = std::max(y, (int)mi.rcWork.top);
+
+    nameBox_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, kBoxClass, L"", WS_POPUP, x, y,
+                               width, height, hwnd_, nullptr, ThisModule(), this);
+    if (!nameBox_) return;
+    ShowWindow(nameBox_, SW_SHOWNOACTIVATE);
+    SetCapture(nameBox_); // the next click anywhere closes it
+}
+
+void AerodromeListPlugin::CloseNameBox()
+{
+    if (nameBox_ && IsWindow(nameBox_)) DestroyWindow(nameBox_);
+    nameBox_ = nullptr;
+}
+
+LRESULT CALLBACK AerodromeListPlugin::NameBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    AerodromeListPlugin* self;
+    if (msg == WM_NCCREATE) {
+        self = static_cast<AerodromeListPlugin*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)self);
+    } else {
+        self = reinterpret_cast<AerodromeListPlugin*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    }
+    if (!self) return DefWindowProcW(h, msg, wp, lp);
+    return self->HandleNameBox(h, msg, wp, lp);
+}
+
+LRESULT AerodromeListPlugin::HandleNameBox(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    RECT rc;
+    GetClientRect(h, &rc);
+    const int itemsTop = kBoxPad + kBoxLineH + 5;
+    auto itemAt = [&](POINT pt) -> int {
+        if (box_.asrs.empty() || pt.x < 0 || pt.x >= rc.right || pt.y < itemsTop) return -1;
+        int i = (pt.y - itemsTop) / kBoxLineH;
+        return i < (int)box_.asrs.size() ? i : -1;
+    };
+
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ oldBmp = SelectObject(mem, bmp);
+
+        // EuroScope-style box: dark face, light/dark bevelled edge.
+        Fill(mem, rc, kStrip);
+        HLine(mem, 0, rc.right, 0, kBevelLight);
+        VLine(mem, 0, 0, rc.bottom, kBevelLight);
+        HLine(mem, 0, rc.right, rc.bottom - 1, kBevelDark);
+        VLine(mem, rc.right - 1, 0, rc.bottom, kBevelDark);
+
+        SelectObject(mem, listFont_);
+        SIZE icao{};
+        GetTextExtentPoint32W(mem, L"WWWW  ", 6, &icao);
+        RECT line{kBoxPad, kBoxPad, rc.right - kBoxPad, kBoxPad + kBoxLineH};
+        Text(mem, Widen(box_.icao), line, kTextBright, DT_LEFT | DT_VCENTER);
+        RECT nameRc = line;
+        nameRc.left += icao.cx;
+        Text(mem, box_.name, nameRc, kText, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        if (!box_.asrs.empty()) {
+            HLine(mem, 4, rc.right - 4, itemsTop - 3, kBevelDark);
+            HLine(mem, 4, rc.right - 4, itemsTop - 2, kBevelMid);
+            for (int i = 0; i < (int)box_.asrs.size(); ++i) {
+                RECT ir{2, itemsTop + i * kBoxLineH, rc.right - 2, itemsTop + (i + 1) * kBoxLineH};
+                if (i == box_.hover) Fill(mem, ir, kSelected);
+                ir.left = kBoxPad;
+                Text(mem, L"Open " + box_.asrs[i], ir, kText, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+            }
+        }
+
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        // Moving well away from the box closes it, like a tooltip.
+        if (pt.x < -60 || pt.y < -60 || pt.x > rc.right + 60 || pt.y > rc.bottom + 60) {
+            PostMessageW(h, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        int i = itemAt(pt);
+        if (i != box_.hover) {
+            box_.hover = i;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        int i = msg == WM_LBUTTONDOWN ? itemAt(pt) : -1;
+        std::string icao = box_.icao;
+        PostMessageW(h, WM_CLOSE, 0, 0);
+        if (i >= 0) OpenIcao(icao, i);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if ((HWND)lp != h) PostMessageW(h, WM_CLOSE, 0, 0);
+        return 0;
+    case WM_CLOSE:
+        if (GetCapture() == h) ReleaseCapture();
+        DestroyWindow(h);
+        return 0;
+    case WM_NCDESTROY:
+        if (nameBox_ == h) nameBox_ = nullptr;
+        break;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
 }
 
 LRESULT CALLBACK AerodromeListPlugin::RowsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -1917,7 +2073,7 @@ LRESULT AerodromeListPlugin::HandleRows(UINT msg, WPARAM wp, LPARAM lp)
             sel_ = i;
             InvalidateRows();
             ClientToScreen(rows_, &pt);
-            ShowContextMenu(i, pt);
+            ShowNameBox(i, pt);
         }
         return 0;
     }

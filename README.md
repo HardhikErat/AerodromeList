@@ -30,7 +30,9 @@ AsrFolders=D:\Some\Path\VABF\ASR\GRP;D:\Another\SectorRoot
 ## Use
 
 The window is styled like EuroScope's own lists. It lists the aerodromes of the
-loaded sector file that have an ASR in the GRP folders.
+loaded sector file that have an ASR in the GRP folders. Each row shows just the
+pin, the ICAO code and the active runways; right-click a row to see the
+aerodrome's full name.
 
 | Action | Result |
 |---|---|
@@ -41,7 +43,7 @@ loaded sector file that have an ASR in the GRP folders.
 | Type a full ICAO and press **Enter** | Opens that aerodrome's ASR straight away |
 | **Master** button | Goes back to the FIR's Master ASR (`<FIR>\ASR\*Master*.asr`) |
 | ▲ on the title strip (or double-click the title) | Collapses the window to its title strip |
-| Right-click an aerodrome | Pin or unpin, or choose between several ASRs (shown as a `+n` badge) |
+| Right-click an aerodrome | Shows its full name in a small dark box (and lets you pick an ASR if it has more than one) |
 | Green ICAO | The ASR you last opened from the list |
 | Blue text at the right of a row | That aerodrome's active runways: `27` (both ways) or `27/14` (departure/arrival) |
 
