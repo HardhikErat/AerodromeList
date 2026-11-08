@@ -32,7 +32,7 @@ using namespace adl;
 namespace {
 
 const char* const kPluginName = "Aerodrome List";
-const char* const kPluginVersion = "1.2.1";
+const char* const kPluginVersion = "1.2.2";
 const char* const kPluginAuthor = "Hardhik Erat";
 const char* const kPluginLicense = "Free to use";
 
@@ -74,7 +74,7 @@ const int kScrollW = 8;
 const int kGrip = 5;
 const int kMasterW = 58;
 const int kSummaryW = 46;     // active-runway column at the right of each row
-const int kPanelHeaderH = 17; // runway panel title strip
+const int kPanelHeaderH = 18; // runway panel title strip (even, so its 12px buttons centre exactly)
 const int kPanelRowH = 17;
 const int kChipW = 34;
 const int kChipH = 13;
@@ -1049,9 +1049,10 @@ void AerodromeListPlugin::Layout()
         panelH = std::min(panelH, std::max(0, (int)(H - 1 - rowsRc_.top - 2 * kRowH - 3)));
         panelRc_ = {1, H - 1 - panelH, W - 1, H - 1};
         rowsRc_.bottom = panelRc_.top - 3;
-        panelCloseRc_ = {W - 1 - 15, panelRc_.top + 3, W - 4, panelRc_.top + kPanelHeaderH - 2};
-        panelDialogRc_ = {panelCloseRc_.left - 4 - 26, panelCloseRc_.top, panelCloseRc_.left - 4,
-                          panelCloseRc_.bottom};
+        // 12x12 and 24x12 buttons: even sizes so the glyphs below centre exactly.
+        int by = panelRc_.top + (kPanelHeaderH - 12) / 2;
+        panelCloseRc_ = {W - 4 - 12, by, W - 4, by + 12};
+        panelDialogRc_ = {panelCloseRc_.left - 4 - 24, by, panelCloseRc_.left - 4, by + 12};
     }
 
     bool show = !settings_.collapsed;
@@ -1190,10 +1191,31 @@ void AerodromeListPlugin::PaintRunwayPanel(HDC dc)
     // "..." opens EuroScope's own runway dialog, "x" closes the panel
     bool down = pressed_ == Button::PanelDialog && hot_ == Button::PanelDialog;
     Bevel(dc, panelDialogRc_, down ? kButtonDown : kButton, !down);
-    Text(dc, L"...", panelDialogRc_, kTextBright, DT_CENTER | DT_VCENTER);
+    {
+        // three 2x2 dots, symmetric in the button (drawn, not text, so they sit in the middle)
+        int o = down ? 1 : 0;
+        int cx = (panelDialogRc_.left + panelDialogRc_.right) / 2 + o; // between cx-1 and cx
+        int cy = (panelDialogRc_.top + panelDialogRc_.bottom) / 2 + o;
+        for (int dx : {-5, -1, 3}) {
+            RECT dot{cx + dx, cy - 1, cx + dx + 2, cy + 1};
+            Fill(dc, dot, kTextBright);
+        }
+    }
     down = pressed_ == Button::PanelClose && hot_ == Button::PanelClose;
     Bevel(dc, panelCloseRc_, down ? kButtonDown : kButton, !down);
-    Text(dc, L"x", panelCloseRc_, kTextBright, DT_CENTER | DT_VCENTER);
+    {
+        // 6x6 cross, symmetric in the 12x12 button
+        int o = down ? 1 : 0;
+        int l = panelCloseRc_.left + 3 + o, t = panelCloseRc_.top + 3 + o;
+        HPEN pen = CreatePen(PS_SOLID, 1, kTextBright);
+        HGDIOBJ old = SelectObject(dc, pen);
+        MoveToEx(dc, l, t, nullptr);
+        LineTo(dc, l + 6, t + 6);
+        MoveToEx(dc, l + 5, t, nullptr);
+        LineTo(dc, l - 1, t + 6);
+        SelectObject(dc, old);
+        DeleteObject(pen);
+    }
 
     auto chip = [&](int x, int y, const wchar_t* label, bool on, COLORREF onColour) {
         RECT r{panelRc_.left + x, y, panelRc_.left + x + kChipW, y + kChipH};
