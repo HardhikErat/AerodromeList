@@ -43,13 +43,42 @@ loaded sector file that have an ASR in the GRP folders.
 | ▲ on the title strip (or double-click the title) | Collapses the window to its title strip |
 | Right-click an aerodrome | Pin or unpin, or choose between several ASRs (shown as a `+n` badge) |
 | Green ICAO | The ASR you last opened from the list |
+| Blue text at the right of a row | That aerodrome's active runways: `27` (both ways) or `27/14` (departure/arrival) |
 
 Drag the title strip to move the window, and drag its edges to resize it.
+
+### Active runways
+
+Useful for enroute and approach controllers who need to set runways at many
+aerodromes quickly. It works for every aerodrome of the loaded sector file,
+including ones without an ASR.
+
+| Action | Result |
+|---|---|
+| Type a full ICAO in the search box, or click the runway cell at the right of a row | Opens that aerodrome's runway panel at the bottom of the window |
+| Click **DEP** / **ARR** next to a runway | Makes that runway active (or inactive) for departures / arrivals |
+| Click **DEP** / **ARR** next to **APT** | Makes the aerodrome itself active (or inactive) for departures / arrivals |
+| Type `VABB 27` in the search box and press **Enter** | Runway 27 becomes the only active runway, both ways |
+| Type `VABB 27/14` and press **Enter** | Departures on 27, arrivals on 14 (lists like `09,14/27` and `27/-` work too) |
+| Type `VABB off` and press **Enter** | VABB and all its runways become inactive |
+| **...** in the panel | Opens EuroScope's own active airport/runway dialog at that aerodrome |
+| **x** in the panel | Closes the panel |
+
+Turning a runway on also turns the aerodrome on for that direction.
+
+Changes go through EuroScope's own "Active airport/runway selector dialog". The
+plug-in opens it hidden, ticks the same boxes you would, and presses OK. So
+EuroScope applies the change exactly as if you had used the dialog: it shows up
+in that dialog and in the ES runway settings, SIDs/STARs are updated, other
+plug-ins (TopSky, Ground Radar) are told, and EuroScope saves the `.rwy` file
+the same way it always does.
 
 Commands for the EuroScope command line:
 
 * `.adl`: hide or show the window for this session (it always reappears when EuroScope starts)
 * `.adl VABB`: open that aerodrome's ASR
+* `.adl rwy VABB 27`, `.adl rwy VABB 27/14`, `.adl rwy VABB off`: set active runways
+* `.adl rwy VABB`: show VABB in the runway panel
 * `.adl master`: go back to the Master ASR
 * `.adl top`: make the window stay on top of all apps (by default it stays on top of EuroScope only)
 * `.adl reload`: scan the ASR folders again (after you add or rename ASR files)
@@ -57,7 +86,8 @@ Commands for the EuroScope command line:
 
 Everything you change in the list is saved as you go, in `AerodromeList.ini`
 next to the DLL. That covers the pinned aerodromes and their order, the window's
-position and size, whether it is collapsed, and how far the list is scrolled.
+position and size, whether it is collapsed, how far the list is scrolled, and
+which aerodrome is in the runway panel.
 Changes are written a fraction of a second after you make them, not only when
 EuroScope closes. So when you close EuroScope (or it crashes) and open the
 sector files again, the list comes back exactly as you left it. Each FIR's copy
@@ -76,7 +106,9 @@ The EuroScope SDK has no "open ASR" function. At load time the plug-in finds
 that routine by matching a byte pattern in `EuroScope.exe` and checks it
 against several markers. If a future EuroScope version doesn't match, the
 plug-in never calls it. Instead, a click copies the ASR path to the clipboard
-and shows a message. Tested on EuroScope 3.2.12.3 (file version 3.2.13.0).
+and shows a message. The runway dialog is found and checked the same way; if
+it doesn't match, the runway controls tell you to use OTHER SET > Active
+airports/runways instead. Tested on EuroScope 3.2.12.3 (file version 3.2.13.0).
 
 ## Build
 

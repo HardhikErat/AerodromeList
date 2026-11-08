@@ -25,22 +25,25 @@
 #include "../sdk/EuroScopePlugIn.h"
 #include "AsrIndex.h"
 #include "AsrOpener.h"
+#include "RunwayDialog.h"
 
 using namespace adl;
 
 namespace {
 
 const char* const kPluginName = "Aerodrome List";
-const char* const kPluginVersion = "1.1.0";
+const char* const kPluginVersion = "1.2.0";
 const char* const kPluginAuthor = "Hardhik Erat";
 const char* const kPluginLicense = "Free to use";
 
 const UINT WM_APP_INDEX_READY = WM_APP + 1;
 const UINT WM_APP_OPEN_ITEM = WM_APP + 2;
 const UINT WM_APP_RETURN_FOCUS = WM_APP + 3;
+const UINT WM_APP_RUNWAY = WM_APP + 4; // wParam = panel row, lParam = 1 for DEP / 0 for ARR
 
 const int IDC_FILTER = 1001;
 const int IDM_PIN = 1900;
+const int IDM_RUNWAYS = 1901;
 const int IDM_ASR_BASE = 2000;
 
 const wchar_t* const kFrameClass = L"AerodromeListPluginWindow";
@@ -72,6 +75,17 @@ const int kPinW = 20;
 const int kScrollW = 8;
 const int kGrip = 5;
 const int kMasterW = 58;
+const int kSummaryW = 46;     // active-runway column at the right of each row
+const int kPanelHeaderH = 17; // runway panel title strip
+const int kPanelRowH = 17;
+const int kChipW = 34;
+const int kChipH = 13;
+const int kChipDepX = 50;     // chip positions inside the runway panel
+const int kChipArrX = 88;
+
+const COLORREF kRunwayText = RGB(110, 190, 230);
+const COLORREF kDepOn = RGB(46, 125, 70);
+const COLORREF kArrOn = RGB(40, 95, 150);
 
 const UINT_PTR kSaveTimer = 1;
 const UINT kSaveDelayMs = 400; // changes are written this long after they stop
@@ -85,7 +99,8 @@ struct Settings {
     RECT rect{0, 0, 0, 0};
     bool topmost = false;
     bool collapsed = false;
-    int scrollTop = 0; // list scroll position in pixels
+    int scrollTop = 0;       // list scroll position in pixels
+    std::string runwayPanel; // aerodrome shown in the runway panel ("" = closed)
     std::vector<std::wstring> extraFolders;
     std::vector<std::string> pins;
 
@@ -101,6 +116,8 @@ struct Settings {
         topmost = GetPrivateProfileIntW(L"Window", L"AlwaysOnTop", 0, file.c_str()) != 0;
         collapsed = GetPrivateProfileIntW(L"Window", L"Collapsed", 0, file.c_str()) != 0;
         scrollTop = std::max(0, (int)GetPrivateProfileIntW(L"List", L"ScrollTop", 0, file.c_str()));
+        GetPrivateProfileStringW(L"List", L"RunwayPanel", L"", buf, 16, file.c_str());
+        runwayPanel = Upper(Narrow(buf));
 
         GetPrivateProfileStringW(L"Folders", L"AsrFolders", L"", buf, 4096, file.c_str());
         for (const std::wstring& part : Split(buf)) {
@@ -129,6 +146,7 @@ struct Settings {
         put(L"Collapsed", collapsed ? 1 : 0);
         WritePrivateProfileStringW(L"Window", L"Visible", nullptr, file.c_str()); // no longer used
         WritePrivateProfileStringW(L"List", L"ScrollTop", std::to_wstring(scrollTop).c_str(), file.c_str());
+        WritePrivateProfileStringW(L"List", L"RunwayPanel", Widen(runwayPanel).c_str(), file.c_str());
     }
 
     void SavePins() const
@@ -270,10 +288,29 @@ HFONT MakeFont(const wchar_t* face, int height, int weight = FW_NORMAL)
 // Plug-in
 // ---------------------------------------------------------------------------
 
+struct RunwayEnd {
+    std::string name; // "09", "27L"
+    bool dep = false;
+    bool arr = false;
+};
+
+// Active airport/runway state of one sector aerodrome, read through the SDK.
+struct SectorAirport {
+    bool dep = false; // airport active for departures
+    bool arr = false; // airport active for arrivals
+    std::vector<RunwayEnd> runways;
+};
+
 struct Airport {
     std::string icao;
     std::string name;
     std::vector<std::wstring> asrs;
+};
+
+// What a click in the runway panel changes.
+struct RunwayToggle {
+    int row = -1;     // 0 = the airport itself, 1.. = runway end
+    bool dep = true;  // DEP or ARR column
 };
 
 class AerodromeListPlugin : public EuroScopePlugIn::CPlugIn
@@ -287,7 +324,7 @@ public:
     void OnAirportRunwayActivityChanged() override;
 
 private:
-    enum class Button { None, Collapse, Master };
+    enum class Button { None, Collapse, Master, PanelClose, PanelDialog };
 
     // window procedures
     static LRESULT CALLBACK FrameProc(HWND, UINT, WPARAM, LPARAM);
@@ -335,6 +372,17 @@ private:
     void OpenIcao(std::string icao, int asrChoice);
     void OpenMaster();
     std::wstring ChooseMaster() const;
+
+    // active runways
+    const SectorAirport* SectorInfo(const std::string& icao) const;
+    std::wstring RunwaySummary(const std::string& icao) const;
+    void SetRunwayPanel(const std::string& icao);
+    int RunwayPanelHeight() const;
+    void PaintRunwayPanel(HDC dc);
+    bool RunwayPanelHit(POINT pt, RunwayToggle& hit) const;
+    void ToggleRunway(const RunwayToggle& t);
+    bool SetActiveRunways(const std::string& icao, const std::string& spec);
+    bool ApplyRunways(const std::string& icao, const RunwayDialog::AirportState& wanted);
     bool OpenPath(const std::wstring& path, const std::string& what);
     void WriteInfo();
     void Message(const std::string& text, bool flash = false);
@@ -352,6 +400,8 @@ private:
 
     // frame layout & state
     RECT headerRc_{}, collapseRc_{}, masterRc_{}, fieldRc_{}, rowsRc_{};
+    RECT panelRc_{}, panelCloseRc_{}, panelDialogRc_{}; // runway panel (empty when closed)
+    bool runwayBusy_ = false;
     Button pressed_ = Button::None;
     Button hot_ = Button::None;
     int expandedHeight_ = 0;
@@ -374,6 +424,7 @@ private:
     std::wstring pluginDir_;
 
     std::vector<std::string> sectorAirports_; // ICAO codes, sorted
+    std::map<std::string, SectorAirport> sectorInfo_; // active airport/runway state per ICAO
     std::string sectorSignature_;
     std::vector<Airport> airports_; // sector aerodromes that have an ASR
     std::vector<int> visible_;      // indices into airports_: pinned (in pin order) first, then A-Z
@@ -392,6 +443,7 @@ private:
 
     bool openerReady_ = false;
     std::string openerDiagnostic_;
+    std::string runwayDiagnostic_;
 };
 
 AerodromeListPlugin* g_plugin = nullptr;
@@ -412,6 +464,7 @@ AerodromeListPlugin::AerodromeListPlugin()
     settings_.Load();
 
     openerReady_ = AsrOpener::Initialise(openerDiagnostic_);
+    RunwayDialog::Initialise(runwayDiagnostic_);
 
     StartIndexing();
     RefreshSectorAirports(true);
@@ -492,25 +545,80 @@ void AerodromeListPlugin::ApplyIndex()
 
 bool AerodromeListPlugin::RefreshSectorAirports(bool force)
 {
+    // First word, upper case: sector names can be "VABB" or "VABB Mumbai".
+    auto code = [](const char* n) {
+        std::string s = Upper(n ? n : "");
+        size_t sp = s.find_first_of(" \t");
+        return sp == std::string::npos ? s : s.substr(0, sp);
+    };
+
     std::vector<std::string> codes;
+    std::map<std::string, SectorAirport> info;
     for (EuroScopePlugIn::CSectorElement e = SectorFileElementSelectFirst(EuroScopePlugIn::SECTOR_ELEMENT_AIRPORT);
          e.IsValid(); e = SectorFileElementSelectNext(e, EuroScopePlugIn::SECTOR_ELEMENT_AIRPORT)) {
-        const char* n = e.GetName();
-        if (!n) continue;
-        std::string code = Upper(n);
-        while (!code.empty() && isspace((unsigned char)code.back())) code.pop_back();
-        if (!code.empty()) codes.push_back(code);
+        std::string c = code(e.GetName());
+        if (c.empty()) continue;
+        codes.push_back(c);
+        SectorAirport& a = info[c];
+        a.dep = e.IsElementActive(true);
+        a.arr = e.IsElementActive(false);
+    }
+    // Runway ends, in sector file order (the same order as EuroScope's runway dialog).
+    for (EuroScopePlugIn::CSectorElement e = SectorFileElementSelectFirst(EuroScopePlugIn::SECTOR_ELEMENT_RUNWAY);
+         e.IsValid(); e = SectorFileElementSelectNext(e, EuroScopePlugIn::SECTOR_ELEMENT_RUNWAY)) {
+        std::string c = code(e.GetAirportName());
+        if (c.empty()) continue;
+        SectorAirport& a = info[c];
+        for (int i = 0; i < 2; ++i) {
+            std::string name = code(e.GetRunwayName(i));
+            if (name.empty()) continue;
+            RunwayEnd r;
+            r.name = name;
+            r.dep = e.IsElementActive(true, i);
+            r.arr = e.IsElementActive(false, i);
+            a.runways.push_back(r);
+        }
     }
     std::sort(codes.begin(), codes.end());
     codes.erase(std::unique(codes.begin(), codes.end()), codes.end());
 
     std::string sig;
     for (auto& c : codes) sig += c + ",";
+    for (auto& kv : info) {
+        sig += kv.first + (kv.second.dep ? "D" : "") + (kv.second.arr ? "A" : "");
+        for (auto& r : kv.second.runways) sig += r.name + (r.dep ? "d" : "") + (r.arr ? "a" : "") + ";";
+    }
     if (!force && sig == sectorSignature_) return false;
     sectorSignature_ = sig;
     sectorAirports_ = std::move(codes);
+    sectorInfo_ = std::move(info);
     RebuildList();
+    if (hwnd_) {
+        Layout(); // the runway panel's height may have changed
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
     return true;
+}
+
+const SectorAirport* AerodromeListPlugin::SectorInfo(const std::string& icao) const
+{
+    auto f = sectorInfo_.find(icao);
+    return f == sectorInfo_.end() ? nullptr : &f->second;
+}
+
+// "27" when the same runways are used both ways, else "27/14" (departure/arrival).
+std::wstring AerodromeListPlugin::RunwaySummary(const std::string& icao) const
+{
+    const SectorAirport* a = SectorInfo(icao);
+    if (!a) return L"";
+    std::string dep, arr;
+    for (const RunwayEnd& r : a->runways) {
+        if (r.dep) dep += (dep.empty() ? "" : ",") + r.name;
+        if (r.arr) arr += (arr.empty() ? "" : ",") + r.name;
+    }
+    if (dep.empty() && arr.empty()) return L"";
+    if (dep == arr) return Widen(dep);
+    return Widen((dep.empty() ? "-" : dep) + "/" + (arr.empty() ? "-" : arr));
 }
 
 bool AerodromeListPlugin::IsPinned(const std::string& icao) const
@@ -536,8 +644,10 @@ void AerodromeListPlugin::RebuildList()
 
     wchar_t text[64] = {};
     if (filter_) GetWindowTextW(filter_, text, 64);
+    // Only the first word filters: "VABB 27" lists VABB (the rest is a runway).
     std::string needle = Upper(Narrow(text));
-    while (!needle.empty() && needle.back() == ' ') needle.pop_back();
+    while (!needle.empty() && needle.front() == ' ') needle.erase(needle.begin());
+    if (needle.find(' ') != std::string::npos) needle = needle.substr(0, needle.find(' '));
     auto matches = [&](const Airport& a) {
         return needle.empty() || a.icao.find(needle) != std::string::npos ||
                Upper(a.name).find(needle) != std::string::npos;
@@ -703,7 +813,8 @@ void AerodromeListPlugin::WriteInfo()
     std::wstring file = pluginDir_ + L"\\AerodromeList-info.txt";
     FILE* f = nullptr;
     if (_wfopen_s(&f, file.c_str(), L"w") != 0 || !f) return;
-    fprintf(f, "Aerodrome List %s\nASR loader: %s\n\nGRP folders:\n", kPluginVersion, openerDiagnostic_.c_str());
+    fprintf(f, "Aerodrome List %s\nASR loader: %s\nRunway dialog: %s\n\nGRP folders:\n", kPluginVersion,
+            openerDiagnostic_.c_str(), runwayDiagnostic_.c_str());
     for (auto& g : index_.grpFolders) {
         auto m = index_.masterByGrp.find(g);
         fprintf(f, "  %s\n    master: %s\n", Narrow(g).c_str(),
@@ -771,6 +882,24 @@ bool AerodromeListPlugin::OnCompileCommand(const char* command)
         OpenMaster();
     } else if (arg == "INFO") {
         WriteInfo();
+    } else if (arg.rfind("RWY", 0) == 0 && (arg.size() == 3 || arg[3] == ' ')) {
+        // ".adl rwy VABB 27", ".adl rwy VABB 27/14", ".adl rwy VABB off", ".adl rwy VABB" (panel)
+        std::string rest = arg.size() > 4 ? arg.substr(4) : "";
+        size_t sp = rest.find(' ');
+        std::string icao = rest.substr(0, sp);
+        std::string spec = sp == std::string::npos ? "" : rest.substr(sp + 1);
+        if (icao.empty()) {
+            Message("Usage: .adl rwy VABB 27  |  .adl rwy VABB 27/14  |  .adl rwy VABB off");
+        } else if (spec.empty()) {
+            if (SectorInfo(icao)) SetRunwayPanel(icao);
+            else Message(icao + " is not an aerodrome of the loaded sector file.");
+        } else {
+            SetActiveRunways(icao, spec);
+        }
+    } else if (arg == "RWYDUMP") {
+        std::wstring file = pluginDir_ + L"\\AerodromeList-runways.txt";
+        Message(RunwayDialog::Dump(file) ? "Runway dialog rows written to " + Narrow(file)
+                                          : "Runway dialog unavailable: " + runwayDiagnostic_);
     } else if (arg.empty()) {
         SetVisible(!(hwnd_ && IsWindowVisible(hwnd_)));
     } else {
@@ -890,6 +1019,18 @@ void AerodromeListPlugin::Layout()
     fieldRc_ = {5, y0, masterRc_.left - 5, y0 + kToolbarH};
     rowsRc_ = {1, fieldRc_.bottom + 5, W - 1, H - 1};
 
+    // Runway panel docked at the bottom; the list gets what is left (at least ~2 rows).
+    panelRc_ = panelCloseRc_ = panelDialogRc_ = RECT{0, 0, 0, 0};
+    int panelH = RunwayPanelHeight();
+    if (panelH > 0 && !settings_.collapsed) {
+        panelH = std::min(panelH, std::max(0, (int)(H - 1 - rowsRc_.top - 2 * kRowH - 3)));
+        panelRc_ = {1, H - 1 - panelH, W - 1, H - 1};
+        rowsRc_.bottom = panelRc_.top - 3;
+        panelCloseRc_ = {W - 1 - 15, panelRc_.top + 3, W - 4, panelRc_.top + kPanelHeaderH - 2};
+        panelDialogRc_ = {panelCloseRc_.left - 4 - 26, panelCloseRc_.top, panelCloseRc_.left - 4,
+                          panelCloseRc_.bottom};
+    }
+
     bool show = !settings_.collapsed;
     ShowWindow(filter_, show ? SW_SHOW : SW_HIDE);
     ShowWindow(rows_, show ? SW_SHOW : SW_HIDE);
@@ -952,13 +1093,221 @@ void AerodromeListPlugin::PaintFrame(HDC dc)
     // line above the list
     HLine(dc, 1, rc.right - 1, rowsRc_.top - 2, kBevelDark);
     HLine(dc, 1, rc.right - 1, rowsRc_.top - 1, kBevelMid);
+
+    PaintRunwayPanel(dc);
 }
 
 AerodromeListPlugin::Button AerodromeListPlugin::ButtonAt(POINT pt) const
 {
     if (PtInRect(&collapseRc_, pt)) return Button::Collapse;
     if (!settings_.collapsed && PtInRect(&masterRc_, pt)) return Button::Master;
+    if (!settings_.collapsed && PtInRect(&panelCloseRc_, pt)) return Button::PanelClose;
+    if (!settings_.collapsed && PtInRect(&panelDialogRc_, pt)) return Button::PanelDialog;
     return Button::None;
+}
+
+// --- runway panel ------------------------------------------------------------------
+
+void AerodromeListPlugin::SetRunwayPanel(const std::string& icao)
+{
+    settings_.runwayPanel = icao;
+    QueueSave();
+    if (!hwnd_) return;
+    Layout();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    InvalidateRows();
+}
+
+int AerodromeListPlugin::RunwayPanelHeight() const
+{
+    if (settings_.runwayPanel.empty()) return 0;
+    const SectorAirport* a = SectorInfo(settings_.runwayPanel);
+    if (!a) return 0;
+    return kPanelHeaderH + (1 + (int)a->runways.size()) * kPanelRowH + 4;
+}
+
+bool AerodromeListPlugin::RunwayPanelHit(POINT pt, RunwayToggle& hit) const
+{
+    if (IsRectEmpty(&panelRc_) || !PtInRect(&panelRc_, pt)) return false;
+    const SectorAirport* a = SectorInfo(settings_.runwayPanel);
+    if (!a) return false;
+    int y = pt.y - (panelRc_.top + kPanelHeaderH + 2);
+    if (y < 0) return false;
+    int row = y / kPanelRowH;
+    if (row > (int)a->runways.size()) return false;
+    int x = pt.x - panelRc_.left;
+    if (x >= kChipDepX - 2 && x < kChipDepX + kChipW + 2) hit.dep = true;
+    else if (x >= kChipArrX - 2 && x < kChipArrX + kChipW + 2) hit.dep = false;
+    else return false;
+    hit.row = row;
+    return true;
+}
+
+void AerodromeListPlugin::PaintRunwayPanel(HDC dc)
+{
+    if (IsRectEmpty(&panelRc_)) return;
+    const SectorAirport* a = SectorInfo(settings_.runwayPanel);
+    if (!a) return;
+    bool enabled = RunwayDialog::Available() && !runwayBusy_;
+
+    RECT clip = panelRc_;
+    HRGN rgn = CreateRectRgnIndirect(&clip);
+    SelectClipRgn(dc, rgn);
+
+    Fill(dc, panelRc_, kBody);
+    RECT head{panelRc_.left, panelRc_.top, panelRc_.right, panelRc_.top + kPanelHeaderH};
+    Bevel(dc, head, kStrip, true);
+    SelectObject(dc, titleFont_);
+    RECT tr = head;
+    tr.left += 6;
+    tr.right = panelDialogRc_.left - 4;
+    std::wstring title = Widen(settings_.runwayPanel) + L"  active runways";
+    Text(dc, title, tr, kTextBright, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+    // "..." opens EuroScope's own runway dialog, "x" closes the panel
+    bool down = pressed_ == Button::PanelDialog && hot_ == Button::PanelDialog;
+    Bevel(dc, panelDialogRc_, down ? kButtonDown : kButton, !down);
+    Text(dc, L"...", panelDialogRc_, kTextBright, DT_CENTER | DT_VCENTER);
+    down = pressed_ == Button::PanelClose && hot_ == Button::PanelClose;
+    Bevel(dc, panelCloseRc_, down ? kButtonDown : kButton, !down);
+    Text(dc, L"x", panelCloseRc_, kTextBright, DT_CENTER | DT_VCENTER);
+
+    auto chip = [&](int x, int y, const wchar_t* label, bool on, COLORREF onColour) {
+        RECT r{panelRc_.left + x, y, panelRc_.left + x + kChipW, y + kChipH};
+        if (on) Bevel(dc, r, enabled ? onColour : kButton, true);
+        else Bevel(dc, r, kField, false);
+        Text(dc, label, r, on ? (enabled ? RGB(240, 240, 240) : kText) : kTextDim, DT_CENTER | DT_VCENTER);
+    };
+
+    SelectObject(dc, buttonFont_);
+    int y = panelRc_.top + kPanelHeaderH + 2;
+    for (int row = 0; row <= (int)a->runways.size(); ++row, y += kPanelRowH) {
+        bool dep = row == 0 ? a->dep : a->runways[row - 1].dep;
+        bool arr = row == 0 ? a->arr : a->runways[row - 1].arr;
+        std::wstring label = row == 0 ? L"APT" : Widen(a->runways[row - 1].name);
+        RECT lr{panelRc_.left + 8, y, panelRc_.left + kChipDepX - 4, y + kChipH};
+        Text(dc, label, lr, row == 0 ? kTextDim : kTextBright, DT_LEFT | DT_VCENTER);
+        int cy = y + (kPanelRowH - kChipH) / 2 - 1;
+        chip(kChipDepX, cy, L"DEP", dep, kDepOn);
+        chip(kChipArrX, cy, L"ARR", arr, kArrOn);
+    }
+
+    SelectClipRgn(dc, nullptr);
+    DeleteObject(rgn);
+}
+
+bool AerodromeListPlugin::ApplyRunways(const std::string& icao, const RunwayDialog::AirportState& wanted)
+{
+    if (!RunwayDialog::Available()) {
+        Message("Setting runways is unavailable in this EuroScope version (" + runwayDiagnostic_ +
+                "). Use OTHER SET > Active airports/runways.");
+        return false;
+    }
+    if (runwayBusy_) return false;
+    runwayBusy_ = true;
+    RunwayDialog::Result r = RunwayDialog::Apply(icao, wanted);
+    runwayBusy_ = false;
+    RefreshSectorAirports(true);
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    switch (r) {
+    case RunwayDialog::Result::Applied:
+        return true;
+    case RunwayDialog::Result::AirportNotListed:
+        Message(icao + " is not in EuroScope's active airport/runway list.");
+        return false;
+    default:
+        Message("Could not set the runways of " + icao + " (" + runwayDiagnostic_ + ").");
+        return false;
+    }
+}
+
+void AerodromeListPlugin::ToggleRunway(const RunwayToggle& t)
+{
+    std::string icao = settings_.runwayPanel;
+    const SectorAirport* a = SectorInfo(icao);
+    if (!a || t.row < 0 || t.row > (int)a->runways.size()) return;
+
+    RunwayDialog::AirportState want;
+    want.airport.dep = a->dep;
+    want.airport.arr = a->arr;
+    for (const RunwayEnd& r : a->runways) want.runways[r.name] = RunwayDialog::Flags{r.dep, r.arr};
+
+    if (t.row == 0) {
+        bool& f = t.dep ? want.airport.dep : want.airport.arr;
+        f = !f;
+    } else {
+        RunwayDialog::Flags& rf = want.runways[a->runways[t.row - 1].name];
+        bool& f = t.dep ? rf.dep : rf.arr;
+        f = !f;
+        // a runway in use means the aerodrome is in use for that direction too
+        if (f) (t.dep ? want.airport.dep : want.airport.arr) = true;
+    }
+    ApplyRunways(icao, want);
+}
+
+// spec: "27" (both ways), "27/14" (departure/arrival), "09,14/27", "27/-", or "OFF".
+bool AerodromeListPlugin::SetActiveRunways(const std::string& icaoIn, const std::string& specIn)
+{
+    std::string icao = Upper(icaoIn);
+    std::string spec = Upper(specIn);
+    spec.erase(std::remove(spec.begin(), spec.end(), ' '), spec.end());
+    const SectorAirport* a = SectorInfo(icao);
+    if (!a) {
+        Message(icao + " is not an aerodrome of the loaded sector file.");
+        return false;
+    }
+    auto split = [](const std::string& s) {
+        std::vector<std::string> out;
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            size_t c = s.find(',', pos);
+            if (c == std::string::npos) c = s.size();
+            std::string part = s.substr(pos, c - pos);
+            if (!part.empty() && part != "-") out.push_back(part);
+            pos = c + 1;
+        }
+        return out;
+    };
+    std::vector<std::string> dep, arr;
+    if (spec != "OFF") {
+        size_t slash = spec.find('/');
+        dep = split(spec.substr(0, slash));
+        arr = slash == std::string::npos ? dep : split(spec.substr(slash + 1));
+        // Runway names in the sector file are zero-padded ("09"); accept "9" too.
+        auto fix = [&](std::vector<std::string>& v) {
+            for (std::string& n : v) {
+                if (!n.empty() && isdigit((unsigned char)n[0]) && (n.size() == 1 || !isdigit((unsigned char)n[1])))
+                    n = "0" + n;
+                bool known = std::any_of(a->runways.begin(), a->runways.end(),
+                                         [&](const RunwayEnd& r) { return r.name == n; });
+                if (!known) {
+                    std::string list;
+                    for (auto& r : a->runways) list += (list.empty() ? "" : " ") + r.name;
+                    Message(icao + " has no runway " + n + " (runways: " + list + ").");
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!fix(dep) || !fix(arr)) return false;
+        if (dep.empty() && arr.empty()) {
+            Message("Give a runway, e.g. " + icao + " 27 or " + icao + " 27/14.");
+            return false;
+        }
+    }
+
+    RunwayDialog::AirportState want;
+    want.airport.dep = !dep.empty();
+    want.airport.arr = !arr.empty();
+    for (const RunwayEnd& r : a->runways) {
+        RunwayDialog::Flags f;
+        f.dep = std::find(dep.begin(), dep.end(), r.name) != dep.end();
+        f.arr = std::find(arr.begin(), arr.end(), r.name) != arr.end();
+        want.runways[r.name] = f;
+    }
+    if (!ApplyRunways(icao, want)) return false;
+    SetRunwayPanel(icao);
+    return true;
 }
 
 void AerodromeListPlugin::SetCollapsed(bool collapsed)
@@ -1115,11 +1464,15 @@ LRESULT AerodromeListPlugin::HandleFrame(UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         pressed_ = hot_ = ButtonAt(pt);
+        RunwayToggle hit;
         if (pressed_ != Button::None) {
             SetCapture(hwnd_);
             InvalidateRect(hwnd_, nullptr, FALSE);
         } else if (PtInRect(&fieldRc_, pt)) {
             SetFocus(filter_);
+        } else if (RunwayPanelHit(pt, hit)) {
+            // DEP/ARR chip: apply after this click has been handled
+            PostMessageW(hwnd_, WM_APP_RUNWAY, hit.row, hit.dep ? 1 : 0);
         }
         return 0;
     }
@@ -1142,6 +1495,13 @@ LRESULT AerodromeListPlugin::HandleFrame(UINT msg, WPARAM wp, LPARAM lp)
         if (b != Button::None && ButtonAt(pt) == b) {
             if (b == Button::Collapse) SetCollapsed(!settings_.collapsed);
             if (b == Button::Master) OpenMaster();
+            if (b == Button::PanelClose) SetRunwayPanel("");
+            if (b == Button::PanelDialog) {
+                if (!RunwayDialog::Show(settings_.runwayPanel))
+                    Message("EuroScope's runway dialog could not be opened from here (" + runwayDiagnostic_ +
+                            "). Use OTHER SET > Active airports/runways.");
+                RefreshSectorAirports(true);
+            }
         }
         return 0;
     }
@@ -1161,9 +1521,25 @@ LRESULT AerodromeListPlugin::HandleFrame(UINT msg, WPARAM wp, LPARAM lp)
         if (LOWORD(wp) == IDC_FILTER && HIWORD(wp) == EN_CHANGE) {
             top_ = 0;
             RebuildList();
+            // A complete ICAO of the sector brings up its runways.
+            wchar_t text[64] = {};
+            GetWindowTextW(filter_, text, 64);
+            std::string first = Upper(Narrow(text));
+            while (!first.empty() && first.front() == ' ') first.erase(first.begin());
+            first = first.substr(0, first.find(' '));
+            if (first.size() == 4 && SectorInfo(first) && first != settings_.runwayPanel) SetRunwayPanel(first);
             return 0;
         }
         break;
+    case WM_APP_RUNWAY: {
+        HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        RunwayToggle t;
+        t.row = (int)wp;
+        t.dep = lp != 0;
+        ToggleRunway(t);
+        SetCursor(old);
+        return 0;
+    }
     case WM_APP_INDEX_READY:
         ApplyIndex();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1288,13 +1664,23 @@ void AerodromeListPlugin::PaintRows(HDC dc, const RECT& rc)
         RECT ir{kPinW, y, kPinW + icaoSize.cx + 2, y + kRowH};
         Text(dc, Widen(a.icao), ir, active ? kActive : kTextBright, DT_LEFT | DT_VCENTER);
 
-        RECT nr{ir.right + 8, y, right, y + kRowH};
+        // Active runways (click to open the runway panel for this aerodrome).
+        RECT sr{right - kSummaryW, y, right, y + kRowH};
+        if (a.icao == settings_.runwayPanel) {
+            RECT cell{sr.left - 2, y + 1, sr.right + 2, y + kRowH - 1};
+            Bevel(dc, cell, kField, false);
+        }
+        std::wstring summary = RunwaySummary(a.icao);
+        if (!summary.empty()) Text(dc, summary, sr, kRunwayText, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
+        else if (i == hover_ && !hoverPin_) Text(dc, L"RWY", sr, kTextDim, DT_RIGHT | DT_VCENTER);
+
+        RECT nr{ir.right + 8, y, sr.left - 6, y + kRowH};
         if (a.asrs.size() > 1) {
             wchar_t badge[8];
             swprintf_s(badge, L"+%d", (int)a.asrs.size() - 1);
             SIZE bs;
             GetTextExtentPoint32W(dc, badge, (int)wcslen(badge), &bs);
-            RECT br{right - bs.cx, y, right, y + kRowH};
+            RECT br{nr.right - bs.cx, y, nr.right, y + kRowH};
             Text(dc, badge, br, kTextDim, DT_RIGHT | DT_VCENTER);
             nr.right = br.left - 6;
         }
@@ -1332,6 +1718,7 @@ void AerodromeListPlugin::ShowContextMenu(int item, POINT screenPt)
     const std::vector<std::wstring> asrs = airports_[visible_[item]].asrs;
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, IDM_PIN, IsPinned(icao) ? L"Unpin" : L"Pin to top");
+    AppendMenuW(menu, MF_STRING, IDM_RUNWAYS, L"Active runways...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     for (size_t i = 0; i < asrs.size(); ++i) {
         const std::wstring& p = asrs[i];
@@ -1342,6 +1729,7 @@ void AerodromeListPlugin::ShowContextMenu(int item, POINT screenPt)
                              nullptr);
     DestroyMenu(menu);
     if (cmd == IDM_PIN) TogglePin(icao);
+    else if (cmd == IDM_RUNWAYS) SetRunwayPanel(icao);
     else if (cmd >= IDM_ASR_BASE) OpenIcao(icao, cmd - IDM_ASR_BASE);
 }
 
@@ -1411,6 +1799,13 @@ LRESULT AerodromeListPlugin::HandleRows(UINT msg, WPARAM wp, LPARAM lp)
         sel_ = i;
         if (pt.x < kPinW) {
             TogglePin(airports_[visible_[i]].icao);
+            return 0;
+        }
+        // The runway cell at the right opens (or closes) the runway panel, not the ASR.
+        int right = rc.right - (HasScrollbar() ? kScrollW + 2 : 4);
+        if (pt.x >= right - kSummaryW - 2) {
+            std::string icao = airports_[visible_[i]].icao;
+            SetRunwayPanel(icao == settings_.runwayPanel ? "" : icao);
             return 0;
         }
         pressItem_ = i;
@@ -1587,6 +1982,18 @@ LRESULT AerodromeListPlugin::HandleFilter(UINT msg, WPARAM wp, LPARAM lp)
             std::string typed = Upper(Narrow(text));
             while (!typed.empty() && typed.back() == ' ') typed.pop_back();
             while (!typed.empty() && typed.front() == ' ') typed.erase(typed.begin());
+
+            // "VABB 27" / "VABB 27/14" / "VABB OFF" sets the active runways.
+            size_t space = typed.find(' ');
+            if (space != std::string::npos) {
+                std::string icao = typed.substr(0, space);
+                std::string spec = typed.substr(space + 1);
+                if (SetActiveRunways(icao, spec)) {
+                    SetWindowTextW(filter_, L"");
+                    PostMessageW(hwnd_, WM_APP_RETURN_FOCUS, 0, 0);
+                }
+                return 0;
+            }
 
             // A complete ICAO opens that aerodrome's ASR straight away.
             if (typed.size() == 4 && index_.asrByIcao.count(typed)) {

@@ -6,3 +6,4 @@ build/
 *.dll.old
 AerodromeList.ini
 AerodromeList-info.txt
+AerodromeList-runways.txt
