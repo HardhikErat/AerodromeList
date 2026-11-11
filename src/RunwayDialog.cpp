@@ -191,8 +191,9 @@ enum class Mode { Apply, Show, Dump };
 
 struct Operation {
     Mode mode = Mode::Apply;
-    std::wstring icao;
-    const RunwayDialog::AirportState* wanted = nullptr;
+    std::wstring icao;                                         // Show
+    std::map<std::wstring, const RunwayDialog::AirportState*> wanted; // Apply: normalised ICAO -> state
+    std::map<std::wstring, bool> seen;                          // Apply: which ICAOs were in the list
     std::wstring dumpFile;
     bool handled = false;
     bool found = false;
@@ -294,10 +295,12 @@ void OnDialogReady(HWND dlg)
 
     // Apply: set the same cells the dialog's own click handler sets.
     Hide(dlg);
-    const RunwayDialog::AirportState& want = *op.wanted;
     for (int i = 0; i < rows; ++i) {
-        if (FirstWord(Cell(lv, i, kColAirport)) != op.icao) continue;
+        auto it = op.wanted.find(FirstWord(Cell(lv, i, kColAirport)));
+        if (it == op.wanted.end()) continue;
         op.found = true;
+        op.seen[it->first] = true;
+        const RunwayDialog::AirportState& want = *it->second;
         SetCell(lv, i, kColAptDep, want.airport.dep ? L"ICON:1" : L"ICON:0");
         SetCell(lv, i, kColAptArr, want.airport.arr ? L"ICON:2" : L"ICON:0");
         std::wstring rwy = Norm(Cell(lv, i, kColRunway));
@@ -418,13 +421,25 @@ bool Available()
 
 Result Apply(const std::string& icao, const AirportState& wanted)
 {
+    std::map<std::string, AirportState> one;
+    one[icao] = wanted;
+    return ApplyMany(one);
+}
+
+Result ApplyMany(const std::map<std::string, AirportState>& wanted, std::vector<std::string>* notListed)
+{
     if (!g_ready) return Result::NotAvailable;
+    if (wanted.empty()) return Result::Applied;
     Operation op;
     op.mode = Mode::Apply;
-    op.icao = Norm(Widen(icao));
-    op.wanted = &wanted;
+    for (const auto& kv : wanted) op.wanted[Norm(Widen(kv.first))] = &kv.second;
     int r = Run(op, true);
     if (r < 0 || !op.handled) return Result::Failed;
+    if (notListed) {
+        notListed->clear();
+        for (const auto& kv : wanted)
+            if (!op.seen.count(Norm(Widen(kv.first)))) notListed->push_back(kv.first);
+    }
     if (!op.found) return Result::AirportNotListed;
     return r == IDOK ? Result::Applied : Result::Failed;
 }

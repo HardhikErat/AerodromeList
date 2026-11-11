@@ -1,6 +1,7 @@
 #pragma once
 #include <map>
 #include <string>
+#include <vector>
 
 // Sets active airports/runways through EuroScope's own
 // "Active airport/runway selector dialog".
@@ -32,6 +33,10 @@ bool Available();
 // Runways of the airport not in the map are left as they are.
 // Must be called on EuroScope's UI thread.
 Result Apply(const std::string& icao, const AirportState& wanted);
+
+// The same for several aerodromes in one pass of the dialog (keys: ICAO).
+// `notListed` receives the aerodromes that were not in EuroScope's list.
+Result ApplyMany(const std::map<std::string, AirportState>& wanted, std::vector<std::string>* notListed = nullptr);
 
 // Opens the dialog normally for the controller, scrolled to the airport (optional).
 bool Show(const std::string& icao);

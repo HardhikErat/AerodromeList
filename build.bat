@@ -18,10 +18,10 @@ del /q build\AerodromeList.dll.old 2>nul
 if exist build\AerodromeList.dll move /y build\AerodromeList.dll build\AerodromeList.dll.old >nul 2>nul
 
 cl /nologo /c /O2 /MT /EHsc /std:c++17 /W3 /GS /DNDEBUG /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
-   /Fo"build\\" src\AerodromeList.cpp src\AsrIndex.cpp src\AsrOpener.cpp src\RunwayDialog.cpp || exit /b 1
+   /Fo"build\\" src\AerodromeList.cpp src\AsrIndex.cpp src\AsrOpener.cpp src\RunwayDialog.cpp src\AutoRunways.cpp src\MetarHighlight.cpp || exit /b 1
 
-link /nologo /DLL /OUT:build\AerodromeList.dll build\AerodromeList.obj build\AsrIndex.obj build\AsrOpener.obj build\RunwayDialog.obj ^
-   sdk\EuroScopePlugInDll.lib user32.lib gdi32.lib comctl32.lib || exit /b 1
+link /nologo /DLL /OUT:build\AerodromeList.dll build\AerodromeList.obj build\AsrIndex.obj build\AsrOpener.obj build\RunwayDialog.obj build\AutoRunways.obj build\MetarHighlight.obj ^
+   sdk\EuroScopePlugInDll.lib user32.lib gdi32.lib comctl32.lib winhttp.lib || exit /b 1
 
 echo.
 echo Built build\AerodromeList.dll

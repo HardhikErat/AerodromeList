@@ -10,8 +10,11 @@ ASR is already open, EuroScope switches to it instead of opening a second copy.
 
 1. Copy `build\AerodromeList.dll` into the FIR's plug-in folder, for example
    `VABF\Plugins\AerodromeList\AerodromeList.dll`.
-2. In EuroScope, go to **Other Set → Plug-ins… → Load** and pick the DLL. Then
-   save your profile so it loads every time.
+2. In EuroScope, go to **Other Set → Plug-ins… → Load** and pick the DLL.
+3. With Aerodrome List selected in that dialog, move **Standard ES radar
+   screen** into "Allowed to draw on types". This is only needed for the METAR
+   highlight (below). Then save your profile so it loads every time, and
+   restart EuroScope.
 
 The plug-in looks for `<FIR>\ASR\GRP` folders by walking up from its own
 folder, from the folders of the other loaded plug-ins (TopSky, GRplugin and so
@@ -75,12 +78,69 @@ in that dialog and in the ES runway settings, SIDs/STARs are updated, other
 plug-ins (TopSky, Ground Radar) are told, and EuroScope saves the `.rwy` file
 the same way it always does.
 
+### Automatic aerodromes and runways when you open a position
+
+When you connect as a controller (for example `VABF_CTR` or `VABB_APP`), the
+plug-in selects the aerodromes of your sector and sets their runways from the
+real-world wind:
+
+1. Your callsign is looked up in the sector's `.ese` file (`[POSITIONS]`).
+2. Every aerodrome of the sector file that lies inside a sector your position
+   owns or covers (its ID in the sector's `OWNER:` list) is selected, plus the
+   aerodrome in the callsign itself (VABB for `VABB_TWR`). `VABF_CTR` gets the
+   whole FIR; `VABB_APP` gets VABB, Juhu and Navi Mumbai.
+3. Their real METARs are fetched in one request from VATSIM's METAR service
+   (the one EuroScope uses), in the background.
+4. For each aerodrome the main (longest) runway's end with the most headwind is
+   made active for departures and arrivals; parallel runways in the same
+   direction come along, and a better-aligned runway is used if the main one has
+   more than 20 kt crosswind. With calm, variable or very light wind the runway
+   that is already active is kept; without a METAR (or with nothing active in
+   calm wind) the main runway is used.
+5. Everything is applied in one go through EuroScope's own runway dialog, and a
+   summary appears in the *Aerodrome List* message tab. The reason for each
+   choice, with its METAR, is written to `AerodromeList-auto.txt` next to the DLL.
+
+This happens once per position per EuroScope session, so your own changes
+afterwards are left alone. Aerodromes outside your sector are not changed.
+
+If the sector file draws a runway with the wrong length, tell the plug-in which
+runway is the main one in `AerodromeList.ini` (the end you name is also used in
+calm wind):
+
+```ini
+[MainRunway]
+VAJJ=08
+```
+
+### METARs of the selected aircraft
+
+Click an aircraft (its symbol or tag) and its departure and destination
+METARs get a yellow box in EuroScope's own **Metars** list, so you don't have to
+search for them. Only aerodromes in the sector of the position you have open
+are boxed (the same aerodromes as above):
+
+* both in your sector: both METARs are boxed
+* one in your sector: only that one
+* neither: nothing is boxed
+
+The box follows the list when you move it, and goes away when you deselect the
+aircraft. A METAR only shows in the Metars list once EuroScope shows that
+station there (for example an active aerodrome). If you see a message asking
+for it, allow the plug-in to draw on "Standard ES radar screen" (Install, step
+3). Like the ASR loader, the Metars list is found in `EuroScope.exe` by
+signature; if a future version doesn't match, there's simply no box.
+
 Commands for the EuroScope command line:
 
 * `.adl`: hide or show the window for this session (it always reappears when EuroScope starts)
 * `.adl VABB`: open that aerodrome's ASR
 * `.adl rwy VABB 27`, `.adl rwy VABB 27/14`, `.adl rwy VABB off`: set active runways
 * `.adl rwy VABB`: show VABB in the runway panel
+* `.adl auto`: select your position's aerodromes and runways again now
+* `.adl auto VABB_APP`: do it as if you had opened that position (also works offline)
+* `.adl auto off` / `.adl auto on`: switch the automatic selection on position open off or on
+* `.adl hl VABB VOMM`: box METARs as if an aircraft from VABB to VOMM were selected (a test); `.adl hl` stops
 * `.adl master`: go back to the Master ASR
 * `.adl top`: make the window stay on top of all apps (by default it stays on top of EuroScope only)
 * `.adl reload`: scan the ASR folders again (after you add or rename ASR files)

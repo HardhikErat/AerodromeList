@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,13 +27,15 @@
 #include "AsrIndex.h"
 #include "AsrOpener.h"
 #include "RunwayDialog.h"
+#include "AutoRunways.h"
+#include "MetarHighlight.h"
 
 using namespace adl;
 
 namespace {
 
 const char* const kPluginName = "Aerodrome List";
-const char* const kPluginVersion = "1.2.2";
+const char* const kPluginVersion = "1.4.0";
 const char* const kPluginAuthor = "Hardhik Erat";
 const char* const kPluginLicense = "Free to use";
 
@@ -40,6 +43,7 @@ const UINT WM_APP_INDEX_READY = WM_APP + 1;
 const UINT WM_APP_OPEN_ITEM = WM_APP + 2;
 const UINT WM_APP_RETURN_FOCUS = WM_APP + 3;
 const UINT WM_APP_RUNWAY = WM_APP + 4; // wParam = panel row, lParam = 1 for DEP / 0 for ARR
+const UINT WM_APP_AUTO_READY = WM_APP + 5; // METARs for the automatic runway selection arrived
 
 const int IDC_FILTER = 1001;
 
@@ -55,6 +59,7 @@ const COLORREF kBevelLight = RGB(88, 88, 88);
 const COLORREF kBevelMid = RGB(69, 69, 69);
 const COLORREF kBevelDark = RGB(17, 17, 17);
 const COLORREF kField = RGB(22, 22, 22);
+const COLORREF kMetarBox = RGB(255, 255, 0); // like EuroScope's box around a list item
 const COLORREF kButton = RGB(58, 58, 58);
 const COLORREF kButtonDown = RGB(44, 44, 44);
 const COLORREF kText = RGB(187, 187, 187);
@@ -101,6 +106,9 @@ struct Settings {
     bool collapsed = false;
     int scrollTop = 0;       // list scroll position in pixels
     std::string runwayPanel; // aerodrome shown in the runway panel ("" = closed)
+    bool autoRunways = true; // select the position's aerodromes/runways when a position is opened
+    std::wstring eseFile;    // optional override for the .ese file
+    std::map<std::string, std::string> mainRunways; // [MainRunway] ICAO=runway end (optional)
     std::vector<std::wstring> extraFolders;
     std::vector<std::string> pins;
 
@@ -117,6 +125,21 @@ struct Settings {
         collapsed = GetPrivateProfileIntW(L"Window", L"Collapsed", 0, file.c_str()) != 0;
         scrollTop = std::max(0, (int)GetPrivateProfileIntW(L"List", L"ScrollTop", 0, file.c_str()));
         GetPrivateProfileStringW(L"List", L"RunwayPanel", L"", buf, 16, file.c_str());
+        autoRunways = GetPrivateProfileIntW(L"Auto", L"Runways", 1, file.c_str()) != 0;
+        GetPrivateProfileStringW(L"Folders", L"EseFile", L"", buf, 4096, file.c_str());
+        eseFile = buf;
+        // [MainRunway] lines: "VAJJ=08"
+        std::vector<wchar_t> sec(8192, 0);
+        DWORD n = GetPrivateProfileSectionW(L"MainRunway", sec.data(), (DWORD)sec.size(), file.c_str());
+        for (const wchar_t* e = sec.data(); e < sec.data() + n && *e; e += wcslen(e) + 1) {
+            std::wstring kv = e;
+            size_t eq = kv.find(L'=');
+            if (eq == std::wstring::npos) continue;
+            std::string k = Upper(Narrow(kv.substr(0, eq))), v = Upper(Narrow(kv.substr(eq + 1)));
+            while (!k.empty() && k.back() == ' ') k.pop_back();
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            if (k.size() == 4 && !v.empty()) mainRunways[k] = v;
+        }
         runwayPanel = Upper(Narrow(buf));
 
         GetPrivateProfileStringW(L"Folders", L"AsrFolders", L"", buf, 4096, file.c_str());
@@ -147,6 +170,7 @@ struct Settings {
         WritePrivateProfileStringW(L"Window", L"Visible", nullptr, file.c_str()); // no longer used
         WritePrivateProfileStringW(L"List", L"ScrollTop", std::to_wstring(scrollTop).c_str(), file.c_str());
         WritePrivateProfileStringW(L"List", L"RunwayPanel", Widen(runwayPanel).c_str(), file.c_str());
+        WritePrivateProfileStringW(L"Auto", L"Runways", autoRunways ? L"1" : L"0", file.c_str());
     }
 
     void SavePins() const
@@ -322,6 +346,11 @@ public:
     void OnTimer(int counter) override;
     bool OnCompileCommand(const char* command) override;
     void OnAirportRunwayActivityChanged() override;
+    EuroScopePlugIn::CRadarScreen* OnRadarScreenCreated(const char* name, bool needRadarContent, bool geoReferenced,
+                                                        bool canBeSaved, bool canBeCreated) override;
+
+    // Radar refresh of any screen: boxes the METARs of the selected aircraft's aerodromes.
+    void OnScreenRefresh(HDC dc, int phase);
 
 private:
     enum class Button { None, Collapse, Master, PanelClose, PanelDialog };
@@ -385,6 +414,14 @@ private:
     bool RunwayPanelHit(POINT pt, RunwayToggle& hit) const;
     void ToggleRunway(const RunwayToggle& t);
     bool SetActiveRunways(const std::string& icao, const std::string& spec);
+
+    // automatic selection when a position is opened
+    std::wstring FindEseFile() const;
+    bool PositionAerodromes(const std::string& callsign, bool manual, std::set<std::string>& found,
+                            std::string& positionId, int& sectors);
+    void SetMyAerodromes(const std::string& callsign, const std::set<std::string>& found);
+    void StartAutoRunways(const std::string& callsign, bool manual);
+    void FinishAutoRunways();
     bool ApplyRunways(const std::string& icao, const RunwayDialog::AirportState& wanted);
     bool OpenPath(const std::wstring& path, const std::string& what);
     void WriteInfo();
@@ -456,6 +493,39 @@ private:
     bool openerReady_ = false;
     std::string openerDiagnostic_;
     std::string runwayDiagnostic_;
+
+    AutoRunways::EseData ese_;
+    std::string autoDoneCallsign_; // position the automatic selection last ran for
+    std::atomic<bool> autoBusy_{false};
+    std::thread autoThread_;
+    std::mutex autoMutex_;
+    struct AutoJob {
+        std::string callsign;
+        std::string positionId;
+        int sectors = 0;
+        std::vector<std::string> airports;
+        std::map<std::string, std::string> metars;
+        bool manual = false;
+    } autoJob_;
+
+    // Aerodromes of the position this controller has open (for the METAR highlight).
+    std::set<std::string> myAerodromes_;
+    std::string myAerodromesCallsign_;
+    std::string liveCallsign_; // callsign while connected as a controller, else empty
+    bool metarHighlightReady_ = false;
+    bool refreshSeen_ = false; // EuroScope only refreshes screens a plug-in may draw on
+    int timerTicks_ = 0;
+    bool drawHintShown_ = false;
+    std::vector<std::string> testEnds_; // ".adl hl VABB VOMM": acts as the selected aircraft's DEP/DEST
+    std::string metarDiagnostic_;
+};
+
+// One per radar screen (ASR); only forwards the refresh to the plug-in.
+class AdlScreen : public EuroScopePlugIn::CRadarScreen
+{
+public:
+    void OnRefresh(HDC dc, int phase) override;
+    void OnAsrContentToBeClosed() override { delete this; }
 };
 
 AerodromeListPlugin* g_plugin = nullptr;
@@ -477,6 +547,7 @@ AerodromeListPlugin::AerodromeListPlugin()
 
     openerReady_ = AsrOpener::Initialise(openerDiagnostic_);
     RunwayDialog::Initialise(runwayDiagnostic_);
+    metarHighlightReady_ = MetarHighlight::Initialise(metarDiagnostic_);
 
     StartIndexing();
     RefreshSectorAirports(true);
@@ -490,8 +561,10 @@ AerodromeListPlugin::AerodromeListPlugin()
 
 AerodromeListPlugin::~AerodromeListPlugin()
 {
+    MetarHighlight::Shutdown();
     notifyHwnd_ = nullptr;
     if (indexThread_.joinable()) indexThread_.join();
+    if (autoThread_.joinable()) autoThread_.join();
     CloseNameBox();
     if (hwnd_ && IsWindow(hwnd_)) {
         DestroyWindow(hwnd_); // WM_DESTROY writes the final state
@@ -867,11 +940,98 @@ void AerodromeListPlugin::OnTimer(int counter)
         StartIndexing();
     }
     if (counter % 2 == 0) RefreshSectorAirports(false);
+
+    // EuroScope only refreshes a plug-in's radar screen when the plug-in may draw there.
+    if (++timerTicks_ == 20 && metarHighlightReady_ && !refreshSeen_ && !drawHintShown_) {
+        drawHintShown_ = true;
+        Message("To box the selected aircraft's METARs in the Metars list, allow Aerodrome List to draw on "
+                "\"Standard ES radar screen\" (Other SET > Plug-ins), then restart EuroScope.");
+    }
+
+    // The position this controller has open decides which METARs get highlighted.
+    if (indexLoaded_) {
+        EuroScopePlugIn::CController me = ControllerMyself();
+        std::string live;
+        if (me.IsValid() && me.IsController()) live = Upper(me.GetCallsign() ? me.GetCallsign() : "");
+        if (live != liveCallsign_) {
+            liveCallsign_ = live;
+            std::set<std::string> found;
+            std::string positionId;
+            int sectors = 0;
+            if (live.empty()) SetMyAerodromes("", found);
+            else if (PositionAerodromes(live, false, found, positionId, sectors)) SetMyAerodromes(live, found);
+        }
+    }
+
+    // A position was opened: select its aerodromes and their runways (once per position).
+    if (settings_.autoRunways && !autoBusy_ && indexLoaded_) {
+        EuroScopePlugIn::CController me = ControllerMyself();
+        if (me.IsValid() && me.IsController()) {
+            std::string cs = Upper(me.GetCallsign() ? me.GetCallsign() : "");
+            if (!cs.empty() && cs != autoDoneCallsign_) StartAutoRunways(cs, false);
+        }
+    }
 }
 
 void AerodromeListPlugin::OnAirportRunwayActivityChanged()
 {
     RefreshSectorAirports(false);
+}
+
+EuroScopePlugIn::CRadarScreen* AerodromeListPlugin::OnRadarScreenCreated(const char*, bool, bool, bool, bool)
+{
+    return metarHighlightReady_ ? new AdlScreen() : nullptr;
+}
+
+void AdlScreen::OnRefresh(HDC dc, int phase)
+{
+    if (g_plugin) g_plugin->OnScreenRefresh(dc, phase);
+}
+
+// The selected aircraft's departure and destination METARs are boxed in
+// EuroScope's Metars list, but only for aerodromes of the open position.
+void AerodromeListPlugin::OnScreenRefresh(HDC dc, int phase)
+{
+    if (!metarHighlightReady_) return;
+    refreshSeen_ = true;
+    if (phase == EuroScopePlugIn::REFRESH_PHASE_BEFORE_TAGS) {
+        MetarHighlight::BeginFrame(); // the lists are drawn after the tags
+        return;
+    }
+    if (phase != EuroScopePlugIn::REFRESH_PHASE_AFTER_LISTS || myAerodromes_.empty()) return;
+
+    std::string ends[2];
+    if (!testEnds_.empty()) {
+        ends[0] = testEnds_[0];
+        if (testEnds_.size() > 1) ends[1] = testEnds_[1];
+    } else {
+        EuroScopePlugIn::CFlightPlan fp = FlightPlanSelectASEL();
+        if (!fp.IsValid()) return;
+        EuroScopePlugIn::CFlightPlanData data = fp.GetFlightPlanData();
+        ends[0] = Upper(data.GetOrigin() ? data.GetOrigin() : "");
+        ends[1] = Upper(data.GetDestination() ? data.GetDestination() : "");
+    }
+
+    HGDIOBJ oldPen = nullptr, oldBrush = nullptr;
+    HPEN pen = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        std::string icao = ends[i].substr(0, ends[i].find_first_of(" \t"));
+        if (icao.empty() || (i == 1 && icao == ends[0].substr(0, ends[0].find_first_of(" \t")))) continue;
+        if (!myAerodromes_.count(icao)) continue;
+        RECT rc;
+        if (!MetarHighlight::RowRect(icao, rc)) continue;
+        if (!pen) {
+            pen = CreatePen(PS_SOLID, 1, kMetarBox);
+            oldPen = SelectObject(dc, pen);
+            oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        }
+        Rectangle(dc, rc.left - 1, rc.top - 1, rc.right + 2, rc.bottom + 2);
+    }
+    if (pen) {
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(pen);
+    }
 }
 
 bool AerodromeListPlugin::OnCompileCommand(const char* command)
@@ -910,6 +1070,42 @@ bool AerodromeListPlugin::OnCompileCommand(const char* command)
         } else {
             SetActiveRunways(icao, spec);
         }
+    } else if (arg == "AUTO" || arg.rfind("AUTO ", 0) == 0) {
+        // ".adl auto" (current position), ".adl auto VABB_APP", ".adl auto on|off"
+        std::string rest = arg.size() > 5 ? arg.substr(5) : "";
+        if (rest == "ON" || rest == "OFF") {
+            settings_.autoRunways = rest == "ON";
+            settings_.SaveWindow();
+            Message(settings_.autoRunways ? "Automatic aerodrome/runway selection on position open: ON"
+                                          : "Automatic aerodrome/runway selection on position open: OFF");
+        } else {
+            std::string cs = rest;
+            if (cs.empty()) {
+                EuroScopePlugIn::CController me = ControllerMyself();
+                if (me.IsValid() && me.GetCallsign()) cs = Upper(me.GetCallsign());
+            }
+            if (cs.empty()) Message("Not connected. Use .adl auto <callsign>, e.g. .adl auto VABF_CTR");
+            else if (autoBusy_) Message("Already selecting runways, please wait.");
+            else StartAutoRunways(cs, true);
+        }
+    } else if (arg == "HL" || arg.rfind("HL ", 0) == 0) {
+        // test: ".adl hl VABB VOMM" boxes those METARs as if such an aircraft were selected; ".adl hl" stops
+        testEnds_.clear();
+        std::string rest = arg.size() > 3 ? arg.substr(3) : "";
+        size_t pos = 0;
+        while (pos < rest.size()) {
+            size_t sp = rest.find(' ', pos);
+            std::string w = rest.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos);
+            if (!w.empty()) testEnds_.push_back(w);
+            if (sp == std::string::npos) break;
+            pos = sp + 1;
+        }
+        std::string mine;
+        for (const std::string& a : myAerodromes_) mine += (mine.empty() ? "" : " ") + a;
+        Message(std::string("METAR highlight: ") + (metarHighlightReady_ ? (refreshSeen_ ? "ready" : "not allowed to draw on the radar screen")
+                                      : "unavailable (" + metarDiagnostic_ + ")") +
+                ". Position: " + (myAerodromesCallsign_.empty() ? "none" : myAerodromesCallsign_) + " [" + mine + "]" +
+                (testEnds_.empty() ? "" : ". Testing with DEP/DEST " + rest));
     } else if (arg == "RWYDUMP") {
         std::wstring file = pluginDir_ + L"\\AerodromeList-runways.txt";
         Message(RunwayDialog::Dump(file) ? "Runway dialog rows written to " + Narrow(file)
@@ -1355,6 +1551,201 @@ bool AerodromeListPlugin::SetActiveRunways(const std::string& icaoIn, const std:
     return true;
 }
 
+// --- automatic selection when a position is opened ------------------------------------
+
+// The .ese of the loaded sector: next to the <FIR> folder whose ASRs this sector uses.
+std::wstring AerodromeListPlugin::FindEseFile() const
+{
+    if (!settings_.eseFile.empty()) return settings_.eseFile;
+    std::map<std::wstring, int> votes;
+    for (const Airport& a : airports_) votes[ParentDir(a.asrs.front())]++;
+    std::vector<std::pair<int, std::wstring>> order;
+    for (const auto& kv : votes) order.push_back({-kv.second, kv.first});
+    std::sort(order.begin(), order.end());
+    std::vector<std::wstring> grps;
+    for (const auto& o : order) grps.push_back(o.second);
+    for (const std::wstring& g : index_.grpFolders) grps.push_back(g);
+    for (const std::wstring& grp : grps) {
+        std::wstring root = ParentDir(ParentDir(ParentDir(grp))); // <root>\<FIR>\ASR\GRP
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileW((root + L"\\*.ese").c_str(), &fd);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        FindClose(f);
+        return root + L"\\" + fd.cFileName;
+    }
+    return L"";
+}
+
+// Aerodromes (of the loaded sector file) inside the sectors of `callsign`'s position.
+bool AerodromeListPlugin::PositionAerodromes(const std::string& callsign, bool manual, std::set<std::string>& found,
+                                             std::string& positionId, int& sectors)
+{
+    found.clear();
+    positionId.clear();
+    sectors = 0;
+    std::wstring ese = FindEseFile();
+    if (ese.empty()) {
+        if (manual) Message("No .ese file found next to the sector files (set [Folders] EseFile= in AerodromeList.ini).");
+        return false;
+    }
+    if (!ese_.loaded || _wcsicmp(ese_.file.c_str(), ese.c_str()) != 0) {
+        if (!AutoRunways::LoadEse(ese, ese_)) {
+            Message("Could not read " + Narrow(ese) + ".");
+            return false;
+        }
+    }
+
+    // Aerodromes of the loaded sector file and where they are.
+    std::map<std::string, AutoRunways::LatLon> airports;
+    for (EuroScopePlugIn::CSectorElement e = SectorFileElementSelectFirst(EuroScopePlugIn::SECTOR_ELEMENT_AIRPORT);
+         e.IsValid(); e = SectorFileElementSelectNext(e, EuroScopePlugIn::SECTOR_ELEMENT_AIRPORT)) {
+        std::string icao = Upper(e.GetName() ? e.GetName() : "");
+        icao = icao.substr(0, icao.find_first_of(" \t"));
+        EuroScopePlugIn::CPosition p;
+        if (icao.size() == 4 && e.GetPosition(&p, 0)) airports[icao] = AutoRunways::LatLon{p.m_Latitude, p.m_Longitude};
+    }
+
+    found = AutoRunways::SectorAerodromes(ese_, callsign, airports, positionId, sectors);
+    if (found.empty()) {
+        if (manual || !positionId.empty())
+            Message(positionId.empty() ? callsign + " is not a position in " + Narrow(ese) + "."
+                                       : callsign + " (" + positionId + ") has no aerodromes of this sector file.");
+        return false;
+    }
+    return true;
+}
+
+void AerodromeListPlugin::SetMyAerodromes(const std::string& callsign, const std::set<std::string>& found)
+{
+    myAerodromes_ = found;
+    myAerodromesCallsign_ = callsign;
+}
+
+void AerodromeListPlugin::StartAutoRunways(const std::string& callsign, bool manual)
+{
+    autoDoneCallsign_ = callsign; // once per position, even if it does not work out
+
+    std::string positionId;
+    int sectors = 0;
+    std::set<std::string> found;
+    if (!PositionAerodromes(callsign, manual, found, positionId, sectors)) return;
+    // ".adl auto <callsign>" also makes that position's METARs the highlighted ones (handy offline).
+    if (manual || callsign == liveCallsign_) SetMyAerodromes(callsign, found);
+
+    {
+        std::lock_guard<std::mutex> lock(autoMutex_);
+        autoJob_ = AutoJob();
+        autoJob_.callsign = callsign;
+        autoJob_.positionId = positionId;
+        autoJob_.sectors = sectors;
+        autoJob_.airports.assign(found.begin(), found.end());
+        autoJob_.manual = manual;
+    }
+    autoBusy_ = true;
+    Message(callsign + ": selecting " + std::to_string(found.size()) +
+            " aerodromes, getting real-world METARs for their runways...");
+
+    if (autoThread_.joinable()) autoThread_.join();
+    std::vector<std::string> list(found.begin(), found.end());
+    autoThread_ = std::thread([this, list]() {
+        std::map<std::string, std::string> metars = AutoRunways::FetchMetars(list);
+        {
+            std::lock_guard<std::mutex> lock(autoMutex_);
+            autoJob_.metars = std::move(metars);
+        }
+        if (HWND h = notifyHwnd_.load()) PostMessageW(h, WM_APP_AUTO_READY, 0, 0);
+        else autoBusy_ = false;
+    });
+}
+
+void AerodromeListPlugin::FinishAutoRunways()
+{
+    AutoJob job;
+    {
+        std::lock_guard<std::mutex> lock(autoMutex_);
+        job = autoJob_;
+    }
+    RefreshSectorAirports(false); // current active runways
+
+    // Runway geometry (ends, headings, lengths) from the sector file.
+    std::map<std::string, std::vector<AutoRunways::Runway>> geometry;
+    for (EuroScopePlugIn::CSectorElement e = SectorFileElementSelectFirst(EuroScopePlugIn::SECTOR_ELEMENT_RUNWAY);
+         e.IsValid(); e = SectorFileElementSelectNext(e, EuroScopePlugIn::SECTOR_ELEMENT_RUNWAY)) {
+        std::string icao = Upper(e.GetAirportName() ? e.GetAirportName() : "");
+        icao = icao.substr(0, icao.find_first_of(" \t"));
+        AutoRunways::Runway r;
+        for (int i = 0; i < 2; ++i) {
+            std::string n = Upper(e.GetRunwayName(i) ? e.GetRunwayName(i) : "");
+            r.end[i] = n.substr(0, n.find_first_of(" \t"));
+            r.heading[i] = e.GetRunwayHeading(i);
+        }
+        EuroScopePlugIn::CPosition a, b;
+        if (e.GetPosition(&a, 0) && e.GetPosition(&b, 1)) r.length = a.DistanceTo(b);
+        if (!r.end[0].empty() && !r.end[1].empty()) geometry[icao].push_back(r);
+    }
+
+    std::map<std::string, RunwayDialog::AirportState> want;
+    std::string summary, details, noMetar;
+    for (const std::string& icao : job.airports) {
+        const SectorAirport* si = SectorInfo(icao);
+        std::vector<std::string> active;
+        if (si)
+            for (const RunwayEnd& r : si->runways)
+                if (r.dep || r.arr) active.push_back(r.name);
+
+        auto m = job.metars.find(icao);
+        AutoRunways::Wind wind = m == job.metars.end() ? AutoRunways::Wind() : AutoRunways::ParseWind(m->second);
+        if (m == job.metars.end()) noMetar += (noMetar.empty() ? "" : " ") + icao;
+
+        std::string why;
+        auto pref = settings_.mainRunways.find(icao);
+        std::vector<std::string> chosen = AutoRunways::Choose(
+            geometry[icao], wind, active, why, pref == settings_.mainRunways.end() ? "" : pref->second);
+
+        RunwayDialog::AirportState st;
+        st.airport.dep = st.airport.arr = true; // the aerodrome is in use
+        if (si)
+            for (const RunwayEnd& r : si->runways) {
+                bool on = std::find(chosen.begin(), chosen.end(), r.name) != chosen.end();
+                st.runways[r.name] = RunwayDialog::Flags{on, on};
+            }
+        want[icao] = st;
+
+        std::string rw;
+        for (const std::string& c : chosen) rw += (rw.empty() ? "" : ",") + c;
+        summary += (summary.empty() ? "" : "  ") + icao + (rw.empty() ? "" : " " + rw);
+        details += icao + "  " + (rw.empty() ? "-" : rw) + "   " + why +
+                   (m == job.metars.end() ? "" : "\n      " + m->second) + "\n";
+    }
+
+    std::vector<std::string> notListed;
+    RunwayDialog::Result r = RunwayDialog::ApplyMany(want, &notListed);
+    autoBusy_ = false;
+    RefreshSectorAirports(true);
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+
+    // Details for anyone who wants to check the choices.
+    std::wstring logFile = pluginDir_ + L"\\AerodromeList-auto.txt";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, logFile.c_str(), L"w") == 0 && f) {
+        fprintf(f, "%s (position %s, %d sectors): %d aerodromes\nSector data: %s\n\n", job.callsign.c_str(),
+                job.positionId.c_str(), job.sectors, (int)job.airports.size(), Narrow(ese_.file).c_str());
+        fputs(details.c_str(), f);
+        fclose(f);
+    }
+
+    if (r == RunwayDialog::Result::NotAvailable) {
+        Message("Could not set runways in this EuroScope version (" + runwayDiagnostic_ + ").");
+        return;
+    }
+    if (r != RunwayDialog::Result::Applied) {
+        Message("Could not set the runways for " + job.callsign + ".");
+        return;
+    }
+    Message(job.callsign + ": " + std::to_string(job.airports.size()) + " aerodromes selected. Runways (real-world wind): " +
+            summary + (noMetar.empty() ? "" : ".  No METAR: " + noMetar + " (kept/main runway)") + ".");
+}
+
 void AerodromeListPlugin::SetCollapsed(bool collapsed)
 {
     RECT wr;
@@ -1576,6 +1967,9 @@ LRESULT AerodromeListPlugin::HandleFrame(UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         break;
+    case WM_APP_AUTO_READY:
+        FinishAutoRunways();
+        return 0;
     case WM_APP_RUNWAY: {
         HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
         RunwayToggle t;
