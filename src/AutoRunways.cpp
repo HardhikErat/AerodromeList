@@ -339,6 +339,25 @@ std::vector<std::string> Choose(const std::vector<Runway>& runwaysIn, const Wind
         for (const std::string& x : v) s += (s.empty() ? "" : ",") + x;
         return s;
     };
+    // Parallel runways in the same direction (09L/09R, 28/29) come along with `chosen`.
+    auto addParallels = [&](std::vector<std::string>& chosen) {
+        std::vector<std::pair<std::string, int>> base;
+        for (const Runway& r : runways)
+            for (int i = 0; i < 2; ++i)
+                if (std::find(chosen.begin(), chosen.end(), r.end[i]) != chosen.end()) base.push_back({r.end[i], r.heading[i]});
+        std::vector<std::string> added;
+        for (const Runway& r : runways)
+            for (int i = 0; i < 2; ++i) {
+                if (std::find(chosen.begin(), chosen.end(), r.end[i]) != chosen.end()) continue;
+                for (auto& b : base)
+                    if (AngleDiff(r.heading[i], b.second) <= 15.0) {
+                        chosen.push_back(r.end[i]);
+                        added.push_back(r.end[i]);
+                        break;
+                    }
+            }
+        return added;
+    };
     auto headwind = [&](int hdg) { return wind.speed * cos((wind.direction - hdg) * kPi / 180.0); };
     auto crosswind = [&](int hdg) { return fabs(wind.speed * sin((wind.direction - hdg) * kPi / 180.0)); };
 
@@ -375,6 +394,8 @@ std::vector<std::string> Choose(const std::vector<Runway>& runwaysIn, const Wind
             for (auto& c : current) chosen.push_back(c.first);
             why = std::string(wind.known ? "calm/variable wind " + std::string(windText) : "no METAR") + ", kept " +
                   join(chosen);
+            std::vector<std::string> added = addParallels(chosen);
+            if (!added.empty()) why += " (+" + join(added) + ")";
             return chosen;
         }
         pick = main->end[preferredEnd];
@@ -398,6 +419,8 @@ std::vector<std::string> Choose(const std::vector<Runway>& runwaysIn, const Wind
             if (worst >= -2.0) {
                 for (auto& c : current) chosen.push_back(c.first);
                 why = std::string("light wind ") + windText + ", kept " + join(chosen);
+                std::vector<std::string> added = addParallels(chosen);
+                if (!added.empty()) why += " (+" + join(added) + ")";
                 return chosen;
             }
         }
@@ -417,13 +440,8 @@ std::vector<std::string> Choose(const std::vector<Runway>& runwaysIn, const Wind
     }
 
     chosen.push_back(pick);
-    // Parallel runways in the same direction (09L/09R, 28/29) come along.
-    for (const Runway& r : runways)
-        for (int i = 0; i < 2; ++i)
-            if (r.end[i] != pick && AngleDiff(r.heading[i], pickHeading) <= 15.0 &&
-                std::find(chosen.begin(), chosen.end(), r.end[i]) == chosen.end())
-                chosen.push_back(r.end[i]);
-    if (chosen.size() > 1) why += " (+" + join(std::vector<std::string>(chosen.begin() + 1, chosen.end())) + ")";
+    std::vector<std::string> added = addParallels(chosen);
+    if (!added.empty()) why += " (+" + join(added) + ")";
     return chosen;
 }
 

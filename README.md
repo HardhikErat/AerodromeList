@@ -113,6 +113,28 @@ calm wind):
 VAJJ=08
 ```
 
+Parallel runways in the same direction are turned on together (VOBL 09L+09R,
+VIDP 28/29L/29R/27), also when light wind keeps the current direction.
+
+Some aerodromes use only one of their runways. These limits from the India
+vACC briefing are built in:
+
+* VOHS: only 09R/27L (09L/27R is used as a taxiway)
+* VECC: only 01R/19L (01L/19R only during maintenance)
+* VOMM: only 07/25 (12/30 only during maintenance)
+
+The wind still picks the direction, but only these runways are used. To change
+one, for example while a runway is closed, or to add another aerodrome, use
+`[UseRunways]` in `AerodromeList.ini` (`ALL` removes a limit). The plugin reads
+this when EuroScope starts:
+
+```ini
+[UseRunways]
+VECC=01L/19R
+VOMM=ALL
+VABB=09/27,14/32
+```
+
 ### METARs of the selected aircraft
 
 Click an aircraft (its symbol or tag) and its departure and destination

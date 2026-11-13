@@ -35,7 +35,7 @@ using namespace adl;
 namespace {
 
 const char* const kPluginName = "Aerodrome List";
-const char* const kPluginVersion = "1.4.0";
+const char* const kPluginVersion = "1.4.1";
 const char* const kPluginAuthor = "Hardhik Erat";
 const char* const kPluginLicense = "Free to use";
 
@@ -92,6 +92,17 @@ const COLORREF kRunwayText = RGB(110, 190, 230);
 const COLORREF kDepOn = RGB(46, 125, 70);
 const COLORREF kArrOn = RGB(40, 95, 150);
 
+// Runways the automatic selection may use, from the India vACC briefing.
+// [UseRunways] in the ini overrides these (ICAO=ALL removes a limit).
+//   VOHS: only the secondary 09R/27L is used; 09L/27R serves as a taxiway.
+//   VECC: one runway at a time, 01L/19R only during maintenance.
+//   VOMM: one runway at a time, 12/30 only during maintenance.
+const std::pair<const char*, const char*> kDefaultUseRunways[] = {
+    {"VOHS", "09R/27L"},
+    {"VECC", "01R/19L"},
+    {"VOMM", "07/25"},
+};
+
 const UINT_PTR kSaveTimer = 1;
 const UINT kSaveDelayMs = 400; // changes are written this long after they stop
 
@@ -109,8 +120,27 @@ struct Settings {
     bool autoRunways = true; // select the position's aerodromes/runways when a position is opened
     std::wstring eseFile;    // optional override for the .ese file
     std::map<std::string, std::string> mainRunways; // [MainRunway] ICAO=runway end (optional)
+    std::map<std::string, std::string> useRunways;  // [UseRunways] ICAO=runways allowed ("ALL" = no limit)
     std::vector<std::wstring> extraFolders;
     std::vector<std::string> pins;
+
+    // "ICAO=value" lines of an ini section.
+    void ReadIcaoSection(const wchar_t* name, std::map<std::string, std::string>& out) const
+    {
+        std::vector<wchar_t> sec(8192, 0);
+        DWORD n = GetPrivateProfileSectionW(name, sec.data(), (DWORD)sec.size(), file.c_str());
+        for (const wchar_t* e = sec.data(); e < sec.data() + n && *e; e += wcslen(e) + 1) {
+            std::wstring kv = e;
+            size_t eq = kv.find(L'=');
+            if (eq == std::wstring::npos) continue;
+            std::string k = Upper(Narrow(kv.substr(0, eq))), v = Upper(Narrow(kv.substr(eq + 1)));
+            while (!k.empty() && k.back() == ' ') k.pop_back();
+            while (!k.empty() && k.front() == ' ') k.erase(k.begin());
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            while (!v.empty() && v.back() == ' ') v.pop_back();
+            if (k.size() == 4 && !v.empty()) out[k] = v;
+        }
+    }
 
     void Load()
     {
@@ -125,22 +155,13 @@ struct Settings {
         collapsed = GetPrivateProfileIntW(L"Window", L"Collapsed", 0, file.c_str()) != 0;
         scrollTop = std::max(0, (int)GetPrivateProfileIntW(L"List", L"ScrollTop", 0, file.c_str()));
         GetPrivateProfileStringW(L"List", L"RunwayPanel", L"", buf, 16, file.c_str());
+        runwayPanel = Upper(Narrow(buf));
         autoRunways = GetPrivateProfileIntW(L"Auto", L"Runways", 1, file.c_str()) != 0;
         GetPrivateProfileStringW(L"Folders", L"EseFile", L"", buf, 4096, file.c_str());
         eseFile = buf;
-        // [MainRunway] lines: "VAJJ=08"
-        std::vector<wchar_t> sec(8192, 0);
-        DWORD n = GetPrivateProfileSectionW(L"MainRunway", sec.data(), (DWORD)sec.size(), file.c_str());
-        for (const wchar_t* e = sec.data(); e < sec.data() + n && *e; e += wcslen(e) + 1) {
-            std::wstring kv = e;
-            size_t eq = kv.find(L'=');
-            if (eq == std::wstring::npos) continue;
-            std::string k = Upper(Narrow(kv.substr(0, eq))), v = Upper(Narrow(kv.substr(eq + 1)));
-            while (!k.empty() && k.back() == ' ') k.pop_back();
-            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
-            if (k.size() == 4 && !v.empty()) mainRunways[k] = v;
-        }
-        runwayPanel = Upper(Narrow(buf));
+        // [MainRunway] lines: "VAJJ=08"; [UseRunways] lines: "VECC=01R/19L"
+        ReadIcaoSection(L"MainRunway", mainRunways);
+        ReadIcaoSection(L"UseRunways", useRunways);
 
         GetPrivateProfileStringW(L"Folders", L"AsrFolders", L"", buf, 4096, file.c_str());
         for (const std::wstring& part : Split(buf)) {
@@ -1697,10 +1718,40 @@ void AerodromeListPlugin::FinishAutoRunways()
         AutoRunways::Wind wind = m == job.metars.end() ? AutoRunways::Wind() : AutoRunways::ParseWind(m->second);
         if (m == job.metars.end()) noMetar += (noMetar.empty() ? "" : " ") + icao;
 
+        // Only the runways this aerodrome really uses (briefing defaults or [UseRunways]).
+        std::vector<AutoRunways::Runway> runways = geometry[icao];
+        std::string limit, limitNote;
+        for (const auto& d : kDefaultUseRunways)
+            if (icao == d.first) limit = d.second;
+        auto use = settings_.useRunways.find(icao);
+        if (use != settings_.useRunways.end()) limit = use->second;
+        if (!limit.empty() && limit != "ALL") {
+            std::set<std::string> ends;
+            std::string word;
+            for (char c : limit + ",") {
+                if (c == ',' || c == '/' || c == ' ' || c == ';') {
+                    if (!word.empty()) ends.insert(word.size() == 1 ? "0" + word : word);
+                    word.clear();
+                } else {
+                    word += c;
+                }
+            }
+            std::vector<AutoRunways::Runway> keep;
+            for (const AutoRunways::Runway& r : runways)
+                if (ends.count(r.end[0]) || ends.count(r.end[1])) keep.push_back(r);
+            if (!keep.empty()) {
+                runways = keep;
+                limitNote = " [only " + limit + "]";
+            } else {
+                limitNote = " [runway limit " + limit + " not in the sector file, ignored]";
+            }
+        }
+
         std::string why;
         auto pref = settings_.mainRunways.find(icao);
         std::vector<std::string> chosen = AutoRunways::Choose(
-            geometry[icao], wind, active, why, pref == settings_.mainRunways.end() ? "" : pref->second);
+            runways, wind, active, why, pref == settings_.mainRunways.end() ? "" : pref->second);
+        why += limitNote;
 
         RunwayDialog::AirportState st;
         st.airport.dep = st.airport.arr = true; // the aerodrome is in use
